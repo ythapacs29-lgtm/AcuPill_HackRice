@@ -1,98 +1,337 @@
 import { useRef, useState } from 'react'
 import './App.css'
 
-import { parseSensorLine } from './utils/parseSensorLine'
-import {
-  createM4Machine,
-  updateM4Machine,
-} from './utils/m4StateMachine'
+function parseSensorLine(line) {
+  const parts = line.trim().split(',')
 
-function App() {
-  // -----------------------------------
-  // CONNECTION
-  // -----------------------------------
-
-  const [connected, setConnected] =
-    useState(false)
-
-  // -----------------------------------
-  // SENSOR DATA
-  // -----------------------------------
-
-  const [sensorData, setSensorData] =
-    useState({
-      t_ms: 0,
-      ax: 0,
-      ay: 0,
-      az: 0,
-    })
-
-  const [lastLine, setLastLine] =
-    useState('No data yet')
-
-  // -----------------------------------
-  // M4 STATE MACHINE
-  // -----------------------------------
-
-  const machineRef =
-    useRef(createM4Machine())
-
-  const [movementState, setMovementState] =
-    useState('IDLE')
-
-  const [debug, setDebug] =
-    useState(
-      machineRef.current.debug
-    )
-
-  const [stateHistory, setStateHistory] =
-    useState([])
-
-  // -----------------------------------
-  // PROCESS ONE SENSOR SAMPLE
-  // -----------------------------------
-
-  function processSensorData(data) {
-    setSensorData(data)
-
-    const nextMachine =
-      updateM4Machine(
-        machineRef.current,
-        data
-      )
-
-    machineRef.current =
-      nextMachine
-
-    setMovementState(
-      nextMachine.state
-    )
-
-    setDebug(
-      nextMachine.debug
-    )
-
-    setStateHistory(
-      nextMachine.history
-    )
+  // Current accelerometer-only format:
+  // t_ms,ax,ay,az
+  if (parts.length !== 4) {
+    return null
   }
 
-  // -----------------------------------
-  // CONNECT TO ARDUINO
-  // -----------------------------------
+  const data = {
+    t_ms: Number(parts[0]),
+    touch: 0,
+    ax: Number(parts[1]),
+    ay: Number(parts[2]),
+    az: Number(parts[3]),
+  }
 
-  async function connectArduino() {
-    if (!('serial' in navigator)) {
-      alert(
-        'Web Serial is not supported. Use Google Chrome.'
-      )
+  if (
+    Number.isNaN(data.t_ms) ||
+    Number.isNaN(data.ax) ||
+    Number.isNaN(data.ay) ||
+    Number.isNaN(data.az)
+  ) {
+    return null
+  }
+
+  return data
+}
+
+function vectorMagnitude(vector) {
+  return Math.sqrt(
+    vector.ax * vector.ax +
+      vector.ay * vector.ay +
+      vector.az * vector.az
+  )
+}
+
+function angleBetweenVectorsDegrees(a, b) {
+  const dot =
+    a.ax * b.ax +
+    a.ay * b.ay +
+    a.az * b.az
+
+  const magA = vectorMagnitude(a)
+  const magB = vectorMagnitude(b)
+
+  if (magA === 0 || magB === 0) {
+    return 0
+  }
+
+  let cosine = dot / (magA * magB)
+
+  // Safety clamp so Math.acos does not break from tiny rounding errors
+  cosine = Math.max(-1, Math.min(1, cosine))
+
+  return Math.acos(cosine) * (180 / Math.PI)
+}
+
+function averageSamples(samples) {
+  if (samples.length === 0) {
+    return null
+  }
+
+  const total = samples.reduce(
+    (sum, sample) => {
+      return {
+        ax: sum.ax + sample.ax,
+        ay: sum.ay + sample.ay,
+        az: sum.az + sample.az,
+      }
+    },
+    { ax: 0, ay: 0, az: 0 }
+  )
+
+  return {
+    ax: total.ax / samples.length,
+    ay: total.ay / samples.length,
+    az: total.az / samples.length,
+  }
+}
+
+function App() {
+  const [connected, setConnected] = useState(false)
+  const [lastLine, setLastLine] = useState('No data yet')
+  const [movementState, setMovementState] = useState('IDLE')
+
+  const [sensorData, setSensorData] = useState({
+    t_ms: 0,
+    touch: 0,
+    ax: 0,
+    ay: 0,
+    az: 0,
+  })
+
+  const [restBaseline, setRestBaseline] = useState({
+    ax: 0,
+    ay: 1,
+    az: 0,
+  })
+
+  const [debug, setDebug] = useState({
+    tiltAngleDegrees: 0,
+    motionAmount: 0,
+    isTilted: false,
+    isMoving: false,
+    isAtRest: false,
+  })
+
+  const [stateHistory, setStateHistory] = useState([])
+
+  const restBaselineRef = useRef({
+    ax: 0,
+    ay: 1,
+    az: 0,
+  })
+
+  const recentSamplesRef = useRef([])
+  const previousDataRef = useRef(null)
+
+  const movementStateRef = useRef('IDLE')
+  const stateStartedAtRef = useRef(0)
+
+  const handlingCountRef = useRef(0)
+  const tiltCountRef = useRef(0)
+  const returnCountRef = useRef(0)
+  const idleCountRef = useRef(0)
+
+  function resetCounters() {
+    handlingCountRef.current = 0
+    tiltCountRef.current = 0
+    returnCountRef.current = 0
+    idleCountRef.current = 0
+  }
+
+  function changeState(newState, t_ms) {
+    if (movementStateRef.current === newState) {
+      return
+    }
+
+    movementStateRef.current = newState
+    stateStartedAtRef.current = t_ms
+    setMovementState(newState)
+    resetCounters()
+
+    setStateHistory((oldHistory) => {
+      const newEntry = {
+        state: newState,
+        time: t_ms,
+      }
+
+      return [newEntry, ...oldHistory].slice(0, 10)
+    })
+
+    console.log('STATE:', newState)
+  }
+
+  function calibrateRest() {
+    const baseline = averageSamples(recentSamplesRef.current)
+
+    if (!baseline) {
+      alert('No samples yet. Connect Arduino first.')
+      return
+    }
+
+    restBaselineRef.current = baseline
+    setRestBaseline(baseline)
+
+    movementStateRef.current = 'IDLE'
+    stateStartedAtRef.current = sensorData.t_ms
+    previousDataRef.current = null
+    resetCounters()
+    setMovementState('IDLE')
+    setStateHistory([
+      {
+        state: 'IDLE',
+        time: sensorData.t_ms,
+      },
+    ])
+  }
+
+  function updateMovementState(data) {
+    const { t_ms, ax, ay, az } = data
+
+    const baseline = restBaselineRef.current
+
+    const currentVector = {
+      ax,
+      ay,
+      az,
+    }
+
+    const tiltAngleDegrees = angleBetweenVectorsDegrees(
+      baseline,
+      currentVector
+    )
+
+    const previousData = previousDataRef.current
+
+    let motionAmount = 0
+
+    if (previousData) {
+      motionAmount =
+        Math.abs(ax - previousData.ax) +
+        Math.abs(ay - previousData.ay) +
+        Math.abs(az - previousData.az)
+    }
+
+    previousDataRef.current = data
+
+    /*
+      Direction-independent tilt rule:
+
+      It does not care whether az is positive or negative.
+      It only cares how far the bottle rotated away from REST.
+    */
+    const isTilted = tiltAngleDegrees > 30
+
+    /*
+      Handling should use motion/change, not just fixed XYZ values.
+    */
+    const isMoving = motionAmount > 0.12
+
+    /*
+      Rest means close to the calibrated rest angle and not moving much.
+    */
+    const isAtRest =
+      tiltAngleDegrees < 15 &&
+      !isMoving
+
+    /*
+      Returned means after tilt, the bottle is upright-ish again.
+      It does not have to exactly match table REST because it may
+      still be in someone's hand.
+    */
+    const isReturned =
+      tiltAngleDegrees < 25
+
+    setDebug({
+      tiltAngleDegrees,
+      motionAmount,
+      isTilted,
+      isMoving,
+      isAtRest,
+    })
+
+    const currentState = movementStateRef.current
+    const timeInCurrentState = t_ms - stateStartedAtRef.current
+
+    // IDLE → HANDLING
+    if (currentState === 'IDLE') {
+      if (isMoving || tiltAngleDegrees > 15) {
+        handlingCountRef.current += 1
+      } else {
+        handlingCountRef.current = 0
+      }
+
+      if (handlingCountRef.current >= 2 || isTilted) {
+        changeState('HANDLING', t_ms)
+      }
 
       return
     }
 
+    // HANDLING → TILTED
+    if (currentState === 'HANDLING') {
+      if (isTilted) {
+        tiltCountRef.current += 1
+      } else {
+        tiltCountRef.current = 0
+      }
+
+      // Keep HANDLING visible briefly
+      if (timeInCurrentState >= 500 && tiltCountRef.current >= 1) {
+        changeState('TILTED', t_ms)
+      }
+
+      // If it was just a bump, return to IDLE
+      if (isAtRest) {
+        idleCountRef.current += 1
+      } else {
+        idleCountRef.current = 0
+      }
+
+      if (idleCountRef.current >= 5) {
+        changeState('IDLE', t_ms)
+      }
+
+      return
+    }
+
+    // TILTED → RETURNED
+    if (currentState === 'TILTED') {
+      if (isReturned) {
+        returnCountRef.current += 1
+      } else {
+        returnCountRef.current = 0
+      }
+
+      // Keep TILTED visible briefly
+      if (timeInCurrentState >= 500 && returnCountRef.current >= 2) {
+        changeState('RETURNED', t_ms)
+      }
+
+      return
+    }
+
+    // RETURNED → IDLE
+    if (currentState === 'RETURNED') {
+      if (isAtRest) {
+        idleCountRef.current += 1
+      } else {
+        idleCountRef.current = 0
+      }
+
+      // Keep RETURNED visible long enough to see it
+      if (timeInCurrentState >= 1000 && idleCountRef.current >= 3) {
+        changeState('IDLE', t_ms)
+      }
+
+      return
+    }
+  }
+
+  async function connectArduino() {
+    if (!('serial' in navigator)) {
+      alert('Web Serial is not supported. Please use Google Chrome.')
+      return
+    }
+
     try {
-      const port =
-        await navigator.serial.requestPort()
+      const port = await navigator.serial.requestPort()
 
       await port.open({
         baudRate: 115200,
@@ -100,23 +339,15 @@ function App() {
 
       setConnected(true)
 
-      const decoder =
-        new TextDecoderStream()
+      const decoder = new TextDecoderStream()
+      port.readable.pipeTo(decoder.writable)
 
-      port.readable
-        .pipeTo(decoder.writable)
-        .catch(() => {})
-
-      const reader =
-        decoder.readable.getReader()
+      const reader = decoder.readable.getReader()
 
       let buffer = ''
 
       while (true) {
-        const {
-          value,
-          done,
-        } = await reader.read()
+        const { value, done } = await reader.read()
 
         if (done) {
           break
@@ -124,297 +355,150 @@ function App() {
 
         buffer += value
 
-        const lines =
-          buffer.split('\n')
-
-        // Keep unfinished line
+        const lines = buffer.split('\n')
         buffer = lines.pop()
 
         for (const line of lines) {
-          const cleanLine =
-            line.trim()
+          const cleanLine = line.trim()
 
           if (!cleanLine) {
             continue
           }
 
-          setLastLine(
-            cleanLine
-          )
+          setLastLine(cleanLine)
 
-          const parsed =
-            parseSensorLine(
-              cleanLine
-            )
+          const parsed = parseSensorLine(cleanLine)
 
-          if (parsed) {
-            processSensorData(
-              parsed
-            )
+          if (!parsed) {
+            continue
           }
+
+          setSensorData(parsed)
+
+          recentSamplesRef.current = [
+            ...recentSamplesRef.current,
+            parsed,
+          ].slice(-12)
+
+          updateMovementState(parsed)
         }
       }
-
-      setConnected(false)
-
     } catch (error) {
       console.error(error)
-
       setConnected(false)
 
       alert(
-        'Could not connect to Arduino. Check USB and try again.'
+        'Could not connect to Arduino. Make sure it is plugged in and try again.'
       )
     }
   }
 
-  // -----------------------------------
-  // RESET M4
-  // -----------------------------------
-
   function resetState() {
-    const freshMachine =
-      createM4Machine()
-
-    freshMachine.stateStartedAt =
-      sensorData.t_ms
-
-    machineRef.current =
-      freshMachine
-
-    setMovementState(
-      'IDLE'
-    )
-
-    setDebug(
-      freshMachine.debug
-    )
-
-    setStateHistory([])
+    movementStateRef.current = 'IDLE'
+    stateStartedAtRef.current = sensorData.t_ms
+    previousDataRef.current = null
+    resetCounters()
+    setMovementState('IDLE')
+    setStateHistory([
+      {
+        state: 'IDLE',
+        time: sensorData.t_ms,
+      },
+    ])
   }
 
   return (
-    <div className="app">
+    <div>
+      <h1>AcuPill M4 Angle-Based Detector</h1>
 
-      <header className="header">
-        <h1>AcuPill</h1>
+      <h2>Device Status</h2>
 
-        <p>
-          Smart medication interaction prototype
-        </p>
-      </header>
+      <p>{connected ? '🟢 CONNECTED' : '🔴 DISCONNECTED'}</p>
 
-      <section className="card">
+      <button onClick={connectArduino} disabled={connected}>
+        Connect Arduino
+      </button>
 
-        <h2>Device Status</h2>
+      <h2>Incoming Arduino Line</h2>
+      <p>{lastLine}</p>
 
-        <div
-          className={
-            connected
-              ? 'status connected'
-              : 'status disconnected'
-          }
-        >
-          {connected
-            ? '● CONNECTED'
-            : '● DISCONNECTED'}
-        </div>
+      <h2>Live Sensor Data</h2>
+      <p>Time: {sensorData.t_ms} ms</p>
+      <p>X: {sensorData.ax}</p>
+      <p>Y: {sensorData.ay}</p>
+      <p>Z: {sensorData.az}</p>
 
-        <button
-          onClick={connectArduino}
-          disabled={connected}
-        >
-          Connect Arduino
-        </button>
+      <h2>Rest Calibration</h2>
+      <p>Rest X: {restBaseline.ax.toFixed(3)}</p>
+      <p>Rest Y: {restBaseline.ay.toFixed(3)}</p>
+      <p>Rest Z: {restBaseline.az.toFixed(3)}</p>
 
-      </section>
+      <button onClick={calibrateRest} disabled={!connected}>
+        Calibrate Rest
+      </button>
 
-      <section className="card">
+      <h2>Current State</h2>
 
-        <h2>Incoming Arduino Line</h2>
+      <p
+        style={{
+          fontSize: '44px',
+          fontWeight: 'bold',
+        }}
+      >
+        {movementState}
+      </p>
 
-        <code className="serial-line">
-          {lastLine}
-        </code>
+      <button onClick={resetState}>
+        Reset State
+      </button>
 
-      </section>
+      <h2>Debug Checks</h2>
+      <p>
+        Tilt angle:{' '}
+        {debug.tiltAngleDegrees.toFixed(1)}°
+      </p>
+      <p>
+        Motion amount:{' '}
+        {debug.motionAmount.toFixed(3)}
+      </p>
+      <p>
+        Tilted: {debug.isTilted ? 'YES' : 'NO'}
+      </p>
+      <p>
+        Moving: {debug.isMoving ? 'YES' : 'NO'}
+      </p>
+      <p>
+        At rest: {debug.isAtRest ? 'YES' : 'NO'}
+      </p>
 
-      <section className="card">
+      <h2>State History</h2>
 
-        <h2>Live Accelerometer</h2>
+      {stateHistory.length === 0 ? (
+        <p>No state changes yet</p>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>State</th>
+              <th>Time</th>
+            </tr>
+          </thead>
 
-        <div className="sensor-grid">
-
-          <div>
-            <span>Time</span>
-            <strong>
-              {sensorData.t_ms} ms
-            </strong>
-          </div>
-
-          <div>
-            <span>X</span>
-            <strong>
-              {sensorData.ax}
-            </strong>
-          </div>
-
-          <div>
-            <span>Y</span>
-            <strong>
-              {sensorData.ay}
-            </strong>
-          </div>
-
-          <div>
-            <span>Z</span>
-            <strong>
-              {sensorData.az}
-            </strong>
-          </div>
-
-        </div>
-
-      </section>
-
-      <section className="card">
-
-        <h2>Current State</h2>
-
-        <div className="current-state">
-          {movementState}
-        </div>
-
-        <button
-          onClick={resetState}
-        >
-          Reset State
-        </button>
-
-        <p className="target">
-          IDLE → HANDLING → TILTED
-          → RETURNED → IDLE
-        </p>
-
-      </section>
-
-      <section className="card">
-
-        <h2>M4 Debug</h2>
-
-        <div className="debug-grid">
-
-          <p>
-            Motion:
-            {' '}
-            <strong>
-              {debug.motionAmount.toFixed(3)}
-            </strong>
-          </p>
-
-          <p>
-            Moving:
-            {' '}
-            <strong>
-              {debug.isMoving
-                ? 'YES'
-                : 'NO'}
-            </strong>
-          </p>
-
-          <p>
-            Idle:
-            {' '}
-            <strong>
-              {debug.isIdle
-                ? 'YES'
-                : 'NO'}
-            </strong>
-          </p>
-
-          <p>
-            Handling:
-            {' '}
-            <strong>
-              {debug.isHandling
-                ? 'YES'
-                : 'NO'}
-            </strong>
-          </p>
-
-          <p>
-            Tilted:
-            {' '}
-            <strong>
-              {debug.isTilted
-                ? 'YES'
-                : 'NO'}
-            </strong>
-          </p>
-
-          <p>
-            Returned:
-            {' '}
-            <strong>
-              {debug.isReturned
-                ? 'YES'
-                : 'NO'}
-            </strong>
-          </p>
-
-        </div>
-
-      </section>
-
-      <section className="card">
-
-        <h2>State History</h2>
-
-        {stateHistory.length === 0 ? (
-
-          <p>
-            No transitions yet.
-          </p>
-
-        ) : (
-
-          <table>
-
-            <thead>
-              <tr>
-                <th>State</th>
-                <th>Arduino Time</th>
+          <tbody>
+            {stateHistory.map((entry, index) => (
+              <tr key={index}>
+                <td>{entry.state}</td>
+                <td>{entry.time} ms</td>
               </tr>
-            </thead>
+            ))}
+          </tbody>
+        </table>
+      )}
 
-            <tbody>
-
-              {stateHistory.map(
-                (entry, index) => (
-
-                  <tr key={index}>
-
-                    <td>
-                      {entry.state}
-                    </td>
-
-                    <td>
-                      {entry.time} ms
-                    </td>
-
-                  </tr>
-
-                )
-              )}
-
-            </tbody>
-
-          </table>
-
-        )}
-
-      </section>
-
+      <h2>M4 Target</h2>
+      <p>
+        IDLE → HANDLING → TILTED → RETURNED → IDLE
+      </p>
     </div>
   )
 }
