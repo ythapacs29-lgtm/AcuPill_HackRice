@@ -1,0 +1,145 @@
+.app {
+  width: min(900px, 92%);
+  margin: 0 auto;
+  padding: 40px 0 80px;
+}
+
+.header {
+  margin-bottom: 30px;
+}
+
+.header h1 {
+  font-size: 44px;
+  margin-bottom: 5px;
+}
+
+.header p {
+  opacity: 0.7;
+}
+
+.card {
+  padding: 24px;
+  margin-bottom: 18px;
+
+  border: 1px solid #ddd;
+  border-radius: 12px;
+}
+
+.card h2 {
+  margin-top: 0;
+}
+
+button {
+  padding: 10px 18px;
+  margin-top: 10px;
+
+  border-radius: 8px;
+  border: 1px solid #aaa;
+
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.status {
+  font-size: 20px;
+  font-weight: bold;
+}
+
+.connected {
+  color: green;
+}
+
+.disconnected {
+  color: crimson;
+}
+
+.serial-line {
+  display: block;
+
+  padding: 12px;
+
+  border-radius: 8px;
+
+  background: #f4f4f4;
+
+  overflow-wrap: anywhere;
+}
+
+.sensor-grid {
+  display: grid;
+
+  grid-template-columns:
+    repeat(
+      auto-fit,
+      minmax(120px, 1fr)
+    );
+
+  gap: 12px;
+}
+
+.sensor-grid div {
+  padding: 16px;
+
+  border: 1px solid #ddd;
+  border-radius: 10px;
+}
+
+.sensor-grid span {
+  display: block;
+
+  font-size: 13px;
+
+  opacity: 0.65;
+}
+
+.sensor-grid strong {
+  display: block;
+
+  margin-top: 5px;
+
+  font-size: 23px;
+}
+
+.current-state {
+  font-size: 42px;
+  font-weight: bold;
+
+  margin: 12px 0;
+}
+
+.target {
+  margin-top: 20px;
+
+  font-weight: 600;
+}
+
+.debug-grid {
+  display: grid;
+
+  grid-template-columns:
+    repeat(
+      auto-fit,
+      minmax(180px, 1fr)
+    );
+
+  gap: 8px;
+}
+
+table {
+  width: 100%;
+
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 10px;
+
+  text-align: left;
+
+  border-bottom: 1px solid #ddd;
+}
