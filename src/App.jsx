@@ -4,22 +4,23 @@ import './App.css'
 function parseSensorLine(line) {
   const parts = line.trim().split(',')
 
-  // Current accelerometer-only format:
-  // t_ms,ax,ay,az
-  if (parts.length !== 4) {
+  // M5 serial format:
+  // t_ms,touch,ax,ay,az
+  if (parts.length !== 5) {
     return null
   }
 
   const data = {
     t_ms: Number(parts[0]),
-    touch: 0,
-    ax: Number(parts[1]),
-    ay: Number(parts[2]),
-    az: Number(parts[3]),
+    touch: Number(parts[1]),
+    ax: Number(parts[2]),
+    ay: Number(parts[3]),
+    az: Number(parts[4]),
   }
 
   if (
     Number.isNaN(data.t_ms) ||
+    Number.isNaN(data.touch) ||
     Number.isNaN(data.ax) ||
     Number.isNaN(data.ay) ||
     Number.isNaN(data.az)
@@ -53,7 +54,6 @@ function angleBetweenVectorsDegrees(a, b) {
 
   let cosine = dot / (magA * magB)
 
-  // Safety clamp so Math.acos does not break from tiny rounding errors
   cosine = Math.max(-1, Math.min(1, cosine))
 
   return Math.acos(cosine) * (180 / Math.PI)
@@ -210,31 +210,14 @@ function App() {
 
     previousDataRef.current = data
 
-    /*
-      Direction-independent tilt rule:
-
-      It does not care whether az is positive or negative.
-      It only cares how far the bottle rotated away from REST.
-    */
     const isTilted = tiltAngleDegrees > 30
 
-    /*
-      Handling should use motion/change, not just fixed XYZ values.
-    */
     const isMoving = motionAmount > 0.12
 
-    /*
-      Rest means close to the calibrated rest angle and not moving much.
-    */
     const isAtRest =
       tiltAngleDegrees < 15 &&
       !isMoving
 
-    /*
-      Returned means after tilt, the bottle is upright-ish again.
-      It does not have to exactly match table REST because it may
-      still be in someone's hand.
-    */
     const isReturned =
       tiltAngleDegrees < 25
 
@@ -272,12 +255,10 @@ function App() {
         tiltCountRef.current = 0
       }
 
-      // Keep HANDLING visible briefly
       if (timeInCurrentState >= 500 && tiltCountRef.current >= 1) {
         changeState('TILTED', t_ms)
       }
 
-      // If it was just a bump, return to IDLE
       if (isAtRest) {
         idleCountRef.current += 1
       } else {
@@ -299,7 +280,6 @@ function App() {
         returnCountRef.current = 0
       }
 
-      // Keep TILTED visible briefly
       if (timeInCurrentState >= 500 && returnCountRef.current >= 2) {
         changeState('RETURNED', t_ms)
       }
@@ -315,7 +295,6 @@ function App() {
         idleCountRef.current = 0
       }
 
-      // Keep RETURNED visible long enough to see it
       if (timeInCurrentState >= 1000 && idleCountRef.current >= 3) {
         changeState('IDLE', t_ms)
       }
@@ -388,7 +367,7 @@ function App() {
       setConnected(false)
 
       alert(
-        'Could not connect to Arduino. Make sure it is plugged in and try again.'
+        'Could not connect to Arduino. Close Arduino Serial Monitor, unplug/replug the Arduino, then try again.'
       )
     }
   }
@@ -409,7 +388,7 @@ function App() {
 
   return (
     <div>
-      <h1>AcuPill M4 Angle-Based Detector</h1>
+      <h1>AcuPill M5 Dashboard</h1>
 
       <h2>Device Status</h2>
 
@@ -422,7 +401,20 @@ function App() {
       <h2>Incoming Arduino Line</h2>
       <p>{lastLine}</p>
 
-      <h2>Live Sensor Data</h2>
+      <h2>Touch Sensor</h2>
+
+      <p
+        style={{
+          fontSize: '36px',
+          fontWeight: 'bold',
+        }}
+      >
+        {sensorData.touch === 1 ? '🟢 TOUCH ACTIVE' : '⚪ NOT TOUCHED'}
+      </p>
+
+      <p>Raw touch value: {sensorData.touch}</p>
+
+      <h2>Live Accelerometer Data</h2>
       <p>Time: {sensorData.t_ms} ms</p>
       <p>X: {sensorData.ax}</p>
       <p>Y: {sensorData.ay}</p>
@@ -437,7 +429,7 @@ function App() {
         Calibrate Rest
       </button>
 
-      <h2>Current State</h2>
+      <h2>Movement State</h2>
 
       <p
         style={{
@@ -453,23 +445,11 @@ function App() {
       </button>
 
       <h2>Debug Checks</h2>
-      <p>
-        Tilt angle:{' '}
-        {debug.tiltAngleDegrees.toFixed(1)}°
-      </p>
-      <p>
-        Motion amount:{' '}
-        {debug.motionAmount.toFixed(3)}
-      </p>
-      <p>
-        Tilted: {debug.isTilted ? 'YES' : 'NO'}
-      </p>
-      <p>
-        Moving: {debug.isMoving ? 'YES' : 'NO'}
-      </p>
-      <p>
-        At rest: {debug.isAtRest ? 'YES' : 'NO'}
-      </p>
+      <p>Tilt angle: {debug.tiltAngleDegrees.toFixed(1)}°</p>
+      <p>Motion amount: {debug.motionAmount.toFixed(3)}</p>
+      <p>Tilted: {debug.isTilted ? 'YES' : 'NO'}</p>
+      <p>Moving: {debug.isMoving ? 'YES' : 'NO'}</p>
+      <p>At rest: {debug.isAtRest ? 'YES' : 'NO'}</p>
 
       <h2>State History</h2>
 
@@ -495,9 +475,18 @@ function App() {
         </table>
       )}
 
-      <h2>M4 Target</h2>
+      <h2>M5 Success Check</h2>
+
       <p>
-        IDLE → HANDLING → TILTED → RETURNED → IDLE
+        Touch should change between NOT TOUCHED and TOUCH ACTIVE while
+        X/Y/Z continue updating.
+      </p>
+
+      <h2>Next Target</h2>
+
+      <p>
+        After M5 passes, move to M6: log one complete medication
+        interaction event.
       </p>
     </div>
   )
