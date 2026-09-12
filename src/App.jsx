@@ -1,10 +1,19 @@
 import { useRef, useState } from 'react'
 import './App.css'
 
+const TILT_THRESHOLD_DEGREES = 30
+const RETURN_THRESHOLD_DEGREES = 25
+const REST_THRESHOLD_DEGREES = 15
+const MOTION_THRESHOLD = 0.12
+
+const MIN_EVENT_DURATION_MS = 1000
+const MAX_EVENT_DURATION_MS = 15000
+const EVENT_COOLDOWN_MS = 4000
+
 function parseSensorLine(line) {
   const parts = line.trim().split(',')
 
-  // M6 format from Arduino:
+  // M7 Arduino format:
   // t_ms,touch,ax,ay,az
   if (parts.length !== 5) {
     return null
@@ -108,10 +117,12 @@ function App() {
     isTilted: false,
     isMoving: false,
     isAtRest: false,
+    cooldownActive: false,
   })
 
   const [stateHistory, setStateHistory] = useState([])
   const [eventLog, setEventLog] = useState([])
+  const [rejectionLog, setRejectionLog] = useState([])
 
   const restBaselineRef = useRef({
     ax: 0,
@@ -131,8 +142,10 @@ function App() {
   const idleCountRef = useRef(0)
 
   const currentInteractionRef = useRef(null)
-  const eventAlreadyLoggedRef = useRef(false)
+  const eventAlreadyDecidedRef = useRef(false)
   const eventIdRef = useRef(1)
+  const rejectionIdRef = useRef(1)
+  const lastEventTimeRef = useRef(-999999)
 
   function resetCounters() {
     handlingCountRef.current = 0
@@ -141,8 +154,26 @@ function App() {
     idleCountRef.current = 0
   }
 
-  function logMedicationInteraction(t_ms) {
-    if (eventAlreadyLoggedRef.current) {
+  function addRejectedInteraction(t_ms, reason, interaction) {
+    const rejection = {
+      id: rejectionIdRef.current,
+      arduinoTime: t_ms,
+      reason,
+      durationMs: interaction ? t_ms - interaction.startTime : 0,
+      touchSeen: interaction ? interaction.touchSeen : false,
+      maxTiltAngle: interaction ? interaction.maxTiltAngle : 0,
+      clockTime: new Date().toLocaleTimeString(),
+    }
+
+    rejectionIdRef.current += 1
+
+    setRejectionLog((oldRejections) => {
+      return [rejection, ...oldRejections].slice(0, 8)
+    })
+  }
+
+  function tryLogMedicationInteraction(t_ms) {
+    if (eventAlreadyDecidedRef.current) {
       return
     }
 
@@ -152,24 +183,80 @@ function App() {
       return
     }
 
+    const durationMs = t_ms - interaction.startTime
+
+    const cooldownActive =
+      t_ms - lastEventTimeRef.current < EVENT_COOLDOWN_MS
+
+    if (cooldownActive) {
+      eventAlreadyDecidedRef.current = true
+      addRejectedInteraction(
+        t_ms,
+        'Rejected: cooldown active',
+        interaction
+      )
+      return
+    }
+
+    if (!interaction.touchSeen) {
+      eventAlreadyDecidedRef.current = true
+      addRejectedInteraction(
+        t_ms,
+        'Rejected: no touch detected',
+        interaction
+      )
+      return
+    }
+
+    if (interaction.maxTiltAngle < TILT_THRESHOLD_DEGREES) {
+      eventAlreadyDecidedRef.current = true
+      addRejectedInteraction(
+        t_ms,
+        'Rejected: tilt too small',
+        interaction
+      )
+      return
+    }
+
+    if (durationMs < MIN_EVENT_DURATION_MS) {
+      eventAlreadyDecidedRef.current = true
+      addRejectedInteraction(
+        t_ms,
+        'Rejected: too fast',
+        interaction
+      )
+      return
+    }
+
+    if (durationMs > MAX_EVENT_DURATION_MS) {
+      eventAlreadyDecidedRef.current = true
+      addRejectedInteraction(
+        t_ms,
+        'Rejected: too long',
+        interaction
+      )
+      return
+    }
+
     const event = {
       id: eventIdRef.current,
       arduinoTime: t_ms,
-      durationMs: t_ms - interaction.startTime,
+      durationMs,
       touchSeen: interaction.touchSeen,
       maxTiltAngle: interaction.maxTiltAngle,
       clockTime: new Date().toLocaleTimeString(),
     }
 
     eventIdRef.current += 1
-    eventAlreadyLoggedRef.current = true
+    lastEventTimeRef.current = t_ms
+    eventAlreadyDecidedRef.current = true
 
     setEventLog((oldEvents) => {
       return [event, ...oldEvents].slice(0, 10)
     })
   }
 
-  function changeState(newState, t_ms, extra = {}) {
+  function changeState(newState, t_ms, context = {}) {
     const oldState = movementStateRef.current
 
     if (oldState === newState) {
@@ -184,20 +271,20 @@ function App() {
     if (oldState === 'IDLE' && newState === 'HANDLING') {
       currentInteractionRef.current = {
         startTime: t_ms,
-        touchSeen: sensorData.touch === 1,
-        maxTiltAngle: extra.tiltAngleDegrees || 0,
+        touchSeen: context.touch === 1,
+        maxTiltAngle: context.tiltAngleDegrees || 0,
       }
 
-      eventAlreadyLoggedRef.current = false
+      eventAlreadyDecidedRef.current = false
     }
 
     if (oldState === 'TILTED' && newState === 'RETURNED') {
-      logMedicationInteraction(t_ms)
+      tryLogMedicationInteraction(t_ms)
     }
 
     if (oldState === 'RETURNED' && newState === 'IDLE') {
       currentInteractionRef.current = null
-      eventAlreadyLoggedRef.current = false
+      eventAlreadyDecidedRef.current = false
     }
 
     setStateHistory((oldHistory) => {
@@ -227,7 +314,7 @@ function App() {
     stateStartedAtRef.current = sensorData.t_ms
     previousDataRef.current = null
     currentInteractionRef.current = null
-    eventAlreadyLoggedRef.current = false
+    eventAlreadyDecidedRef.current = false
 
     resetCounters()
     setMovementState('IDLE')
@@ -268,15 +355,21 @@ function App() {
 
     previousDataRef.current = data
 
-    const isTilted = tiltAngleDegrees > 30
-    const isMoving = motionAmount > 0.12
+    const isTilted =
+      tiltAngleDegrees > TILT_THRESHOLD_DEGREES
+
+    const isMoving =
+      motionAmount > MOTION_THRESHOLD
 
     const isAtRest =
-      tiltAngleDegrees < 15 &&
+      tiltAngleDegrees < REST_THRESHOLD_DEGREES &&
       !isMoving
 
     const isReturned =
-      tiltAngleDegrees < 25
+      tiltAngleDegrees < RETURN_THRESHOLD_DEGREES
+
+    const cooldownActive =
+      t_ms - lastEventTimeRef.current < EVENT_COOLDOWN_MS
 
     if (currentInteractionRef.current) {
       if (touch === 1) {
@@ -295,14 +388,17 @@ function App() {
       isTilted,
       isMoving,
       isAtRest,
+      cooldownActive,
     })
 
     const currentState = movementStateRef.current
     const timeInCurrentState = t_ms - stateStartedAtRef.current
 
+    // ==========================================
     // IDLE → HANDLING
+    // ==========================================
     if (currentState === 'IDLE') {
-      if (isMoving || tiltAngleDegrees > 15 || touch === 1) {
+      if (isMoving || tiltAngleDegrees > REST_THRESHOLD_DEGREES) {
         handlingCountRef.current += 1
       } else {
         handlingCountRef.current = 0
@@ -310,6 +406,7 @@ function App() {
 
       if (handlingCountRef.current >= 2 || isTilted) {
         changeState('HANDLING', t_ms, {
+          touch,
           tiltAngleDegrees,
         })
       }
@@ -317,7 +414,9 @@ function App() {
       return
     }
 
+    // ==========================================
     // HANDLING → TILTED
+    // ==========================================
     if (currentState === 'HANDLING') {
       if (isTilted) {
         tiltCountRef.current += 1
@@ -327,10 +426,12 @@ function App() {
 
       if (timeInCurrentState >= 500 && tiltCountRef.current >= 1) {
         changeState('TILTED', t_ms, {
+          touch,
           tiltAngleDegrees,
         })
       }
 
+      // If it was just a bump or touch without tilt, go back to IDLE.
       if (isAtRest && touch === 0) {
         idleCountRef.current += 1
       } else {
@@ -339,6 +440,7 @@ function App() {
 
       if (idleCountRef.current >= 5) {
         changeState('IDLE', t_ms, {
+          touch,
           tiltAngleDegrees,
         })
       }
@@ -346,7 +448,9 @@ function App() {
       return
     }
 
+    // ==========================================
     // TILTED → RETURNED
+    // ==========================================
     if (currentState === 'TILTED') {
       if (isReturned) {
         returnCountRef.current += 1
@@ -356,6 +460,7 @@ function App() {
 
       if (timeInCurrentState >= 500 && returnCountRef.current >= 2) {
         changeState('RETURNED', t_ms, {
+          touch,
           tiltAngleDegrees,
         })
       }
@@ -363,7 +468,9 @@ function App() {
       return
     }
 
+    // ==========================================
     // RETURNED → IDLE
+    // ==========================================
     if (currentState === 'RETURNED') {
       if (isAtRest && touch === 0) {
         idleCountRef.current += 1
@@ -373,6 +480,7 @@ function App() {
 
       if (timeInCurrentState >= 1000 && idleCountRef.current >= 3) {
         changeState('IDLE', t_ms, {
+          touch,
           tiltAngleDegrees,
         })
       }
@@ -455,7 +563,7 @@ function App() {
     stateStartedAtRef.current = sensorData.t_ms
     previousDataRef.current = null
     currentInteractionRef.current = null
-    eventAlreadyLoggedRef.current = false
+    eventAlreadyDecidedRef.current = false
 
     resetCounters()
     setMovementState('IDLE')
@@ -470,11 +578,17 @@ function App() {
   function clearEventLog() {
     setEventLog([])
     eventIdRef.current = 1
+    lastEventTimeRef.current = -999999
+  }
+
+  function clearRejectionLog() {
+    setRejectionLog([])
+    rejectionIdRef.current = 1
   }
 
   return (
     <div>
-      <h1>AcuPill M6 Dashboard</h1>
+      <h1>AcuPill M7 Robustness Dashboard</h1>
 
       <h2>Device Status</h2>
       <p>{connected ? '🟢 CONNECTED' : '🔴 DISCONNECTED'}</p>
@@ -526,10 +640,10 @@ function App() {
         Reset State
       </button>
 
-      <h2>M6 Medication Interaction Log</h2>
+      <h2>M7 Valid Medication Interaction Log</h2>
 
       {eventLog.length === 0 ? (
-        <p>No medication interaction detected yet.</p>
+        <p>No valid medication interaction detected yet.</p>
       ) : (
         <table>
           <thead>
@@ -564,12 +678,54 @@ function App() {
         Clear Event Log
       </button>
 
+      <h2>Rejected Interaction Log</h2>
+
+      {rejectionLog.length === 0 ? (
+        <p>No rejected interactions yet.</p>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Reason</th>
+              <th>Arduino time</th>
+              <th>Duration</th>
+              <th>Touch seen</th>
+              <th>Max tilt</th>
+              <th>Clock time</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {rejectionLog.map((rejection) => (
+              <tr key={rejection.id}>
+                <td>{rejection.id}</td>
+                <td>{rejection.reason}</td>
+                <td>{rejection.arduinoTime} ms</td>
+                <td>{rejection.durationMs} ms</td>
+                <td>{rejection.touchSeen ? 'YES' : 'NO'}</td>
+                <td>{rejection.maxTiltAngle.toFixed(1)}°</td>
+                <td>{rejection.clockTime}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <button
+        onClick={clearRejectionLog}
+        disabled={rejectionLog.length === 0}
+      >
+        Clear Rejection Log
+      </button>
+
       <h2>Debug Checks</h2>
       <p>Tilt angle: {debug.tiltAngleDegrees.toFixed(1)}°</p>
       <p>Motion amount: {debug.motionAmount.toFixed(3)}</p>
       <p>Tilted: {debug.isTilted ? 'YES' : 'NO'}</p>
       <p>Moving: {debug.isMoving ? 'YES' : 'NO'}</p>
       <p>At rest: {debug.isAtRest ? 'YES' : 'NO'}</p>
+      <p>Cooldown: {debug.cooldownActive ? 'ACTIVE' : 'NO'}</p>
 
       <h2>State History</h2>
 
@@ -595,13 +751,9 @@ function App() {
         </table>
       )}
 
-      <h2>M6 Success Check</h2>
-      <p>
-        One full bottle interaction should create exactly one event:
-      </p>
-      <p>
-        IDLE → HANDLING → TILTED → RETURNED → one Possible Medication Interaction
-      </p>
+      <h2>M7 Success Check</h2>
+      <p>Intentional touch + pickup + tilt + return should log 1 valid event.</p>
+      <p>Touch-only, lift-only, tilt-without-touch, and bump tests should log 0 valid events.</p>
     </div>
   )
 }
