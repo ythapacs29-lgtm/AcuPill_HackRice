@@ -4,7 +4,7 @@ import './App.css'
 function parseSensorLine(line) {
   const parts = line.trim().split(',')
 
-  // M5 serial format:
+  // M6 format from Arduino:
   // t_ms,touch,ax,ay,az
   if (parts.length !== 5) {
     return null
@@ -85,7 +85,6 @@ function averageSamples(samples) {
 function App() {
   const [connected, setConnected] = useState(false)
   const [lastLine, setLastLine] = useState('No data yet')
-  const [movementState, setMovementState] = useState('IDLE')
 
   const [sensorData, setSensorData] = useState({
     t_ms: 0,
@@ -94,6 +93,8 @@ function App() {
     ay: 0,
     az: 0,
   })
+
+  const [movementState, setMovementState] = useState('IDLE')
 
   const [restBaseline, setRestBaseline] = useState({
     ax: 0,
@@ -110,6 +111,7 @@ function App() {
   })
 
   const [stateHistory, setStateHistory] = useState([])
+  const [eventLog, setEventLog] = useState([])
 
   const restBaselineRef = useRef({
     ax: 0,
@@ -128,6 +130,10 @@ function App() {
   const returnCountRef = useRef(0)
   const idleCountRef = useRef(0)
 
+  const currentInteractionRef = useRef(null)
+  const eventAlreadyLoggedRef = useRef(false)
+  const eventIdRef = useRef(1)
+
   function resetCounters() {
     handlingCountRef.current = 0
     tiltCountRef.current = 0
@@ -135,8 +141,38 @@ function App() {
     idleCountRef.current = 0
   }
 
-  function changeState(newState, t_ms) {
-    if (movementStateRef.current === newState) {
+  function logMedicationInteraction(t_ms) {
+    if (eventAlreadyLoggedRef.current) {
+      return
+    }
+
+    const interaction = currentInteractionRef.current
+
+    if (!interaction) {
+      return
+    }
+
+    const event = {
+      id: eventIdRef.current,
+      arduinoTime: t_ms,
+      durationMs: t_ms - interaction.startTime,
+      touchSeen: interaction.touchSeen,
+      maxTiltAngle: interaction.maxTiltAngle,
+      clockTime: new Date().toLocaleTimeString(),
+    }
+
+    eventIdRef.current += 1
+    eventAlreadyLoggedRef.current = true
+
+    setEventLog((oldEvents) => {
+      return [event, ...oldEvents].slice(0, 10)
+    })
+  }
+
+  function changeState(newState, t_ms, extra = {}) {
+    const oldState = movementStateRef.current
+
+    if (oldState === newState) {
       return
     }
 
@@ -144,6 +180,25 @@ function App() {
     stateStartedAtRef.current = t_ms
     setMovementState(newState)
     resetCounters()
+
+    if (oldState === 'IDLE' && newState === 'HANDLING') {
+      currentInteractionRef.current = {
+        startTime: t_ms,
+        touchSeen: sensorData.touch === 1,
+        maxTiltAngle: extra.tiltAngleDegrees || 0,
+      }
+
+      eventAlreadyLoggedRef.current = false
+    }
+
+    if (oldState === 'TILTED' && newState === 'RETURNED') {
+      logMedicationInteraction(t_ms)
+    }
+
+    if (oldState === 'RETURNED' && newState === 'IDLE') {
+      currentInteractionRef.current = null
+      eventAlreadyLoggedRef.current = false
+    }
 
     setStateHistory((oldHistory) => {
       const newEntry = {
@@ -171,6 +226,9 @@ function App() {
     movementStateRef.current = 'IDLE'
     stateStartedAtRef.current = sensorData.t_ms
     previousDataRef.current = null
+    currentInteractionRef.current = null
+    eventAlreadyLoggedRef.current = false
+
     resetCounters()
     setMovementState('IDLE')
     setStateHistory([
@@ -182,7 +240,7 @@ function App() {
   }
 
   function updateMovementState(data) {
-    const { t_ms, ax, ay, az } = data
+    const { t_ms, touch, ax, ay, az } = data
 
     const baseline = restBaselineRef.current
 
@@ -211,7 +269,6 @@ function App() {
     previousDataRef.current = data
 
     const isTilted = tiltAngleDegrees > 30
-
     const isMoving = motionAmount > 0.12
 
     const isAtRest =
@@ -220,6 +277,17 @@ function App() {
 
     const isReturned =
       tiltAngleDegrees < 25
+
+    if (currentInteractionRef.current) {
+      if (touch === 1) {
+        currentInteractionRef.current.touchSeen = true
+      }
+
+      currentInteractionRef.current.maxTiltAngle = Math.max(
+        currentInteractionRef.current.maxTiltAngle,
+        tiltAngleDegrees
+      )
+    }
 
     setDebug({
       tiltAngleDegrees,
@@ -234,14 +302,16 @@ function App() {
 
     // IDLE → HANDLING
     if (currentState === 'IDLE') {
-      if (isMoving || tiltAngleDegrees > 15) {
+      if (isMoving || tiltAngleDegrees > 15 || touch === 1) {
         handlingCountRef.current += 1
       } else {
         handlingCountRef.current = 0
       }
 
       if (handlingCountRef.current >= 2 || isTilted) {
-        changeState('HANDLING', t_ms)
+        changeState('HANDLING', t_ms, {
+          tiltAngleDegrees,
+        })
       }
 
       return
@@ -256,17 +326,21 @@ function App() {
       }
 
       if (timeInCurrentState >= 500 && tiltCountRef.current >= 1) {
-        changeState('TILTED', t_ms)
+        changeState('TILTED', t_ms, {
+          tiltAngleDegrees,
+        })
       }
 
-      if (isAtRest) {
+      if (isAtRest && touch === 0) {
         idleCountRef.current += 1
       } else {
         idleCountRef.current = 0
       }
 
       if (idleCountRef.current >= 5) {
-        changeState('IDLE', t_ms)
+        changeState('IDLE', t_ms, {
+          tiltAngleDegrees,
+        })
       }
 
       return
@@ -281,7 +355,9 @@ function App() {
       }
 
       if (timeInCurrentState >= 500 && returnCountRef.current >= 2) {
-        changeState('RETURNED', t_ms)
+        changeState('RETURNED', t_ms, {
+          tiltAngleDegrees,
+        })
       }
 
       return
@@ -289,14 +365,16 @@ function App() {
 
     // RETURNED → IDLE
     if (currentState === 'RETURNED') {
-      if (isAtRest) {
+      if (isAtRest && touch === 0) {
         idleCountRef.current += 1
       } else {
         idleCountRef.current = 0
       }
 
       if (timeInCurrentState >= 1000 && idleCountRef.current >= 3) {
-        changeState('IDLE', t_ms)
+        changeState('IDLE', t_ms, {
+          tiltAngleDegrees,
+        })
       }
 
       return
@@ -376,6 +454,9 @@ function App() {
     movementStateRef.current = 'IDLE'
     stateStartedAtRef.current = sensorData.t_ms
     previousDataRef.current = null
+    currentInteractionRef.current = null
+    eventAlreadyLoggedRef.current = false
+
     resetCounters()
     setMovementState('IDLE')
     setStateHistory([
@@ -386,12 +467,16 @@ function App() {
     ])
   }
 
+  function clearEventLog() {
+    setEventLog([])
+    eventIdRef.current = 1
+  }
+
   return (
     <div>
-      <h1>AcuPill M5 Dashboard</h1>
+      <h1>AcuPill M6 Dashboard</h1>
 
       <h2>Device Status</h2>
-
       <p>{connected ? '🟢 CONNECTED' : '🔴 DISCONNECTED'}</p>
 
       <button onClick={connectArduino} disabled={connected}>
@@ -402,16 +487,14 @@ function App() {
       <p>{lastLine}</p>
 
       <h2>Touch Sensor</h2>
-
       <p
         style={{
-          fontSize: '36px',
+          fontSize: '32px',
           fontWeight: 'bold',
         }}
       >
         {sensorData.touch === 1 ? '🟢 TOUCH ACTIVE' : '⚪ NOT TOUCHED'}
       </p>
-
       <p>Raw touch value: {sensorData.touch}</p>
 
       <h2>Live Accelerometer Data</h2>
@@ -430,7 +513,6 @@ function App() {
       </button>
 
       <h2>Movement State</h2>
-
       <p
         style={{
           fontSize: '44px',
@@ -442,6 +524,44 @@ function App() {
 
       <button onClick={resetState}>
         Reset State
+      </button>
+
+      <h2>M6 Medication Interaction Log</h2>
+
+      {eventLog.length === 0 ? (
+        <p>No medication interaction detected yet.</p>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Status</th>
+              <th>Arduino time</th>
+              <th>Duration</th>
+              <th>Touch seen</th>
+              <th>Max tilt</th>
+              <th>Clock time</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {eventLog.map((event) => (
+              <tr key={event.id}>
+                <td>{event.id}</td>
+                <td>Possible Medication Interaction</td>
+                <td>{event.arduinoTime} ms</td>
+                <td>{event.durationMs} ms</td>
+                <td>{event.touchSeen ? 'YES' : 'NO'}</td>
+                <td>{event.maxTiltAngle.toFixed(1)}°</td>
+                <td>{event.clockTime}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <button onClick={clearEventLog} disabled={eventLog.length === 0}>
+        Clear Event Log
       </button>
 
       <h2>Debug Checks</h2>
@@ -475,18 +595,12 @@ function App() {
         </table>
       )}
 
-      <h2>M5 Success Check</h2>
-
+      <h2>M6 Success Check</h2>
       <p>
-        Touch should change between NOT TOUCHED and TOUCH ACTIVE while
-        X/Y/Z continue updating.
+        One full bottle interaction should create exactly one event:
       </p>
-
-      <h2>Next Target</h2>
-
       <p>
-        After M5 passes, move to M6: log one complete medication
-        interaction event.
+        IDLE → HANDLING → TILTED → RETURNED → one Possible Medication Interaction
       </p>
     </div>
   )
