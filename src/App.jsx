@@ -13,7 +13,7 @@ const EVENT_COOLDOWN_MS = 4000
 function parseSensorLine(line) {
   const parts = line.trim().split(',')
 
-  // M7 Arduino format:
+  // M8 Arduino format:
   // t_ms,touch,ax,ay,az
   if (parts.length !== 5) {
     return null
@@ -62,7 +62,6 @@ function angleBetweenVectorsDegrees(a, b) {
   }
 
   let cosine = dot / (magA * magB)
-
   cosine = Math.max(-1, Math.min(1, cosine))
 
   return Math.acos(cosine) * (180 / Math.PI)
@@ -89,6 +88,35 @@ function averageSamples(samples) {
     ay: total.ay / samples.length,
     az: total.az / samples.length,
   }
+}
+
+function average(numbers) {
+  if (numbers.length === 0) {
+    return 0
+  }
+
+  const total = numbers.reduce((sum, value) => sum + value, 0)
+  return total / numbers.length
+}
+
+function standardDeviation(numbers) {
+  if (numbers.length === 0) {
+    return 0
+  }
+
+  const avg = average(numbers)
+
+  const variance =
+    numbers.reduce((sum, value) => {
+      const difference = value - avg
+      return sum + difference * difference
+    }, 0) / numbers.length
+
+  return Math.sqrt(variance)
+}
+
+function sum(numbers) {
+  return numbers.reduce((total, value) => total + value, 0)
 }
 
 function App() {
@@ -154,14 +182,45 @@ function App() {
     idleCountRef.current = 0
   }
 
+  function calculateMotorTelemetry(interaction, endTime) {
+    const samples = interaction.samples
+
+    const motionValues = samples.map((sample) => sample.motionAmount)
+    const tiltValues = samples.map((sample) => sample.tiltAngleDegrees)
+
+    const durationMs = endTime - interaction.startTime
+
+    return {
+      durationMs,
+      sampleCount: samples.length,
+      maxTiltAngle: Math.max(...tiltValues, 0),
+      averageTiltAngle: average(tiltValues),
+      totalMotion: sum(motionValues),
+      averageMotion: average(motionValues),
+      peakMotion: Math.max(...motionValues, 0),
+      motionVariability: standardDeviation(motionValues),
+    }
+  }
+
   function addRejectedInteraction(t_ms, reason, interaction) {
+    const telemetry = interaction
+      ? calculateMotorTelemetry(interaction, t_ms)
+      : {
+          durationMs: 0,
+          sampleCount: 0,
+          maxTiltAngle: 0,
+          averageMotion: 0,
+          peakMotion: 0,
+          motionVariability: 0,
+        }
+
     const rejection = {
       id: rejectionIdRef.current,
       arduinoTime: t_ms,
       reason,
-      durationMs: interaction ? t_ms - interaction.startTime : 0,
+      durationMs: telemetry.durationMs,
       touchSeen: interaction ? interaction.touchSeen : false,
-      maxTiltAngle: interaction ? interaction.maxTiltAngle : 0,
+      maxTiltAngle: telemetry.maxTiltAngle,
       clockTime: new Date().toLocaleTimeString(),
     }
 
@@ -183,7 +242,7 @@ function App() {
       return
     }
 
-    const durationMs = t_ms - interaction.startTime
+    const telemetry = calculateMotorTelemetry(interaction, t_ms)
 
     const cooldownActive =
       t_ms - lastEventTimeRef.current < EVENT_COOLDOWN_MS
@@ -208,7 +267,7 @@ function App() {
       return
     }
 
-    if (interaction.maxTiltAngle < TILT_THRESHOLD_DEGREES) {
+    if (telemetry.maxTiltAngle < TILT_THRESHOLD_DEGREES) {
       eventAlreadyDecidedRef.current = true
       addRejectedInteraction(
         t_ms,
@@ -218,7 +277,7 @@ function App() {
       return
     }
 
-    if (durationMs < MIN_EVENT_DURATION_MS) {
+    if (telemetry.durationMs < MIN_EVENT_DURATION_MS) {
       eventAlreadyDecidedRef.current = true
       addRejectedInteraction(
         t_ms,
@@ -228,7 +287,7 @@ function App() {
       return
     }
 
-    if (durationMs > MAX_EVENT_DURATION_MS) {
+    if (telemetry.durationMs > MAX_EVENT_DURATION_MS) {
       eventAlreadyDecidedRef.current = true
       addRejectedInteraction(
         t_ms,
@@ -241,10 +300,9 @@ function App() {
     const event = {
       id: eventIdRef.current,
       arduinoTime: t_ms,
-      durationMs,
-      touchSeen: interaction.touchSeen,
-      maxTiltAngle: interaction.maxTiltAngle,
       clockTime: new Date().toLocaleTimeString(),
+      touchSeen: interaction.touchSeen,
+      ...telemetry,
     }
 
     eventIdRef.current += 1
@@ -272,7 +330,7 @@ function App() {
       currentInteractionRef.current = {
         startTime: t_ms,
         touchSeen: context.touch === 1,
-        maxTiltAngle: context.tiltAngleDegrees || 0,
+        samples: [],
       }
 
       eventAlreadyDecidedRef.current = false
@@ -376,10 +434,15 @@ function App() {
         currentInteractionRef.current.touchSeen = true
       }
 
-      currentInteractionRef.current.maxTiltAngle = Math.max(
-        currentInteractionRef.current.maxTiltAngle,
-        tiltAngleDegrees
-      )
+      currentInteractionRef.current.samples.push({
+        t_ms,
+        touch,
+        ax,
+        ay,
+        az,
+        tiltAngleDegrees,
+        motionAmount,
+      })
     }
 
     setDebug({
@@ -394,9 +457,7 @@ function App() {
     const currentState = movementStateRef.current
     const timeInCurrentState = t_ms - stateStartedAtRef.current
 
-    // ==========================================
     // IDLE → HANDLING
-    // ==========================================
     if (currentState === 'IDLE') {
       if (isMoving || tiltAngleDegrees > REST_THRESHOLD_DEGREES) {
         handlingCountRef.current += 1
@@ -414,9 +475,7 @@ function App() {
       return
     }
 
-    // ==========================================
     // HANDLING → TILTED
-    // ==========================================
     if (currentState === 'HANDLING') {
       if (isTilted) {
         tiltCountRef.current += 1
@@ -431,7 +490,6 @@ function App() {
         })
       }
 
-      // If it was just a bump or touch without tilt, go back to IDLE.
       if (isAtRest && touch === 0) {
         idleCountRef.current += 1
       } else {
@@ -448,9 +506,7 @@ function App() {
       return
     }
 
-    // ==========================================
     // TILTED → RETURNED
-    // ==========================================
     if (currentState === 'TILTED') {
       if (isReturned) {
         returnCountRef.current += 1
@@ -468,9 +524,7 @@ function App() {
       return
     }
 
-    // ==========================================
     // RETURNED → IDLE
-    // ==========================================
     if (currentState === 'RETURNED') {
       if (isAtRest && touch === 0) {
         idleCountRef.current += 1
@@ -588,7 +642,7 @@ function App() {
 
   return (
     <div>
-      <h1>AcuPill M7 Robustness Dashboard</h1>
+      <h1>AcuPill M8 Motor Telemetry Dashboard</h1>
 
       <h2>Device Status</h2>
       <p>{connected ? '🟢 CONNECTED' : '🔴 DISCONNECTED'}</p>
@@ -640,7 +694,7 @@ function App() {
         Reset State
       </button>
 
-      <h2>M7 Valid Medication Interaction Log</h2>
+      <h2>M8 Valid Medication Interaction Log</h2>
 
       {eventLog.length === 0 ? (
         <p>No valid medication interaction detected yet.</p>
@@ -650,11 +704,16 @@ function App() {
             <tr>
               <th>#</th>
               <th>Status</th>
-              <th>Arduino time</th>
+              <th>Time</th>
               <th>Duration</th>
-              <th>Touch seen</th>
+              <th>Touch</th>
               <th>Max tilt</th>
-              <th>Clock time</th>
+              <th>Avg tilt</th>
+              <th>Total motion</th>
+              <th>Avg motion</th>
+              <th>Peak motion</th>
+              <th>Variability</th>
+              <th>Samples</th>
             </tr>
           </thead>
 
@@ -663,11 +722,16 @@ function App() {
               <tr key={event.id}>
                 <td>{event.id}</td>
                 <td>Possible Medication Interaction</td>
-                <td>{event.arduinoTime} ms</td>
+                <td>{event.clockTime}</td>
                 <td>{event.durationMs} ms</td>
                 <td>{event.touchSeen ? 'YES' : 'NO'}</td>
                 <td>{event.maxTiltAngle.toFixed(1)}°</td>
-                <td>{event.clockTime}</td>
+                <td>{event.averageTiltAngle.toFixed(1)}°</td>
+                <td>{event.totalMotion.toFixed(3)}</td>
+                <td>{event.averageMotion.toFixed(3)}</td>
+                <td>{event.peakMotion.toFixed(3)}</td>
+                <td>{event.motionVariability.toFixed(3)}</td>
+                <td>{event.sampleCount}</td>
               </tr>
             ))}
           </tbody>
@@ -690,7 +754,7 @@ function App() {
               <th>Reason</th>
               <th>Arduino time</th>
               <th>Duration</th>
-              <th>Touch seen</th>
+              <th>Touch</th>
               <th>Max tilt</th>
               <th>Clock time</th>
             </tr>
@@ -751,9 +815,11 @@ function App() {
         </table>
       )}
 
-      <h2>M7 Success Check</h2>
-      <p>Intentional touch + pickup + tilt + return should log 1 valid event.</p>
-      <p>Touch-only, lift-only, tilt-without-touch, and bump tests should log 0 valid events.</p>
+      <h2>M8 Success Check</h2>
+      <p>
+        Every valid event should now include duration, max tilt, average tilt,
+        total motion, average motion, peak motion, variability, and sample count.
+      </p>
     </div>
   )
 }
