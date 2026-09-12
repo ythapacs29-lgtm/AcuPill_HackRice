@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const TILT_THRESHOLD_DEGREES = 30
@@ -10,10 +10,12 @@ const MIN_EVENT_DURATION_MS = 1000
 const MAX_EVENT_DURATION_MS = 15000
 const EVENT_COOLDOWN_MS = 4000
 
+const STORAGE_KEY = 'acupill_event_history_v1'
+
 function parseSensorLine(line) {
   const parts = line.trim().split(',')
 
-  // M8 Arduino format:
+  // M9 Arduino format:
   // t_ms,touch,ax,ay,az
   if (parts.length !== 5) {
     return null
@@ -119,7 +121,69 @@ function sum(numbers) {
   return numbers.reduce((total, value) => total + value, 0)
 }
 
+function loadSavedEvents() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY)
+
+    if (!saved) {
+      return []
+    }
+
+    const parsed = JSON.parse(saved)
+
+    if (!Array.isArray(parsed)) {
+      return []
+    }
+
+    return parsed
+  } catch (error) {
+    console.error('Could not load saved events:', error)
+    return []
+  }
+}
+
+function saveEvents(events) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(events))
+  } catch (error) {
+    console.error('Could not save events:', error)
+  }
+}
+
+function calculateBaseline(events) {
+  if (events.length === 0) {
+    return null
+  }
+
+  return {
+    count: events.length,
+    durationMs: average(events.map((event) => event.durationMs)),
+    maxTiltAngle: average(events.map((event) => event.maxTiltAngle)),
+    totalMotion: average(events.map((event) => event.totalMotion)),
+    averageMotion: average(events.map((event) => event.averageMotion)),
+    peakMotion: average(events.map((event) => event.peakMotion)),
+    motionVariability: average(
+      events.map((event) => event.motionVariability)
+    ),
+  }
+}
+
+function percentChange(latestValue, baselineValue) {
+  if (baselineValue === 0) {
+    return 0
+  }
+
+  return ((latestValue - baselineValue) / baselineValue) * 100
+}
+
+function formatPercent(value) {
+  const sign = value > 0 ? '+' : ''
+  return `${sign}${value.toFixed(1)}%`
+}
+
 function App() {
+  const savedEvents = loadSavedEvents()
+
   const [connected, setConnected] = useState(false)
   const [lastLine, setLastLine] = useState('No data yet')
 
@@ -149,7 +213,7 @@ function App() {
   })
 
   const [stateHistory, setStateHistory] = useState([])
-  const [eventLog, setEventLog] = useState([])
+  const [eventLog, setEventLog] = useState(savedEvents)
   const [rejectionLog, setRejectionLog] = useState([])
 
   const restBaselineRef = useRef({
@@ -171,9 +235,59 @@ function App() {
 
   const currentInteractionRef = useRef(null)
   const eventAlreadyDecidedRef = useRef(false)
-  const eventIdRef = useRef(1)
+
+  const eventIdRef = useRef(
+    savedEvents.length > 0
+      ? Math.max(...savedEvents.map((event) => event.id)) + 1
+      : 1
+  )
+
   const rejectionIdRef = useRef(1)
   const lastEventTimeRef = useRef(-999999)
+
+  useEffect(() => {
+    saveEvents(eventLog)
+  }, [eventLog])
+
+  const latestEvent = eventLog[0] || null
+  const baselineEvents = eventLog.slice(1)
+  const baseline = calculateBaseline(baselineEvents)
+
+  let durationChange = 0
+  let motionChange = 0
+  let variabilityChange = 0
+  let baselineInsight = 'Collect more valid interactions to build a baseline.'
+
+  if (latestEvent && baseline && baseline.count >= 3) {
+    durationChange = percentChange(
+      latestEvent.durationMs,
+      baseline.durationMs
+    )
+
+    motionChange = percentChange(
+      latestEvent.totalMotion,
+      baseline.totalMotion
+    )
+
+    variabilityChange = percentChange(
+      latestEvent.motionVariability,
+      baseline.motionVariability
+    )
+
+    if (durationChange > 25) {
+      baselineInsight =
+        'Latest interaction was slower than the personal baseline.'
+    } else if (motionChange > 25 || variabilityChange > 25) {
+      baselineInsight =
+        'Latest interaction showed more movement variation than baseline.'
+    } else if (durationChange < -25) {
+      baselineInsight =
+        'Latest interaction was faster than the personal baseline.'
+    } else {
+      baselineInsight =
+        'Latest interaction looks close to the personal baseline.'
+    }
+  }
 
   function resetCounters() {
     handlingCountRef.current = 0
@@ -310,7 +424,7 @@ function App() {
     eventAlreadyDecidedRef.current = true
 
     setEventLog((oldEvents) => {
-      return [event, ...oldEvents].slice(0, 10)
+      return [event, ...oldEvents].slice(0, 20)
     })
   }
 
@@ -387,7 +501,7 @@ function App() {
   function updateMovementState(data) {
     const { t_ms, touch, ax, ay, az } = data
 
-    const baseline = restBaselineRef.current
+    const baselineVector = restBaselineRef.current
 
     const currentVector = {
       ax,
@@ -396,7 +510,7 @@ function App() {
     }
 
     const tiltAngleDegrees = angleBetweenVectorsDegrees(
-      baseline,
+      baselineVector,
       currentVector
     )
 
@@ -457,7 +571,6 @@ function App() {
     const currentState = movementStateRef.current
     const timeInCurrentState = t_ms - stateStartedAtRef.current
 
-    // IDLE → HANDLING
     if (currentState === 'IDLE') {
       if (isMoving || tiltAngleDegrees > REST_THRESHOLD_DEGREES) {
         handlingCountRef.current += 1
@@ -475,7 +588,6 @@ function App() {
       return
     }
 
-    // HANDLING → TILTED
     if (currentState === 'HANDLING') {
       if (isTilted) {
         tiltCountRef.current += 1
@@ -506,7 +618,6 @@ function App() {
       return
     }
 
-    // TILTED → RETURNED
     if (currentState === 'TILTED') {
       if (isReturned) {
         returnCountRef.current += 1
@@ -524,7 +635,6 @@ function App() {
       return
     }
 
-    // RETURNED → IDLE
     if (currentState === 'RETURNED') {
       if (isAtRest && touch === 0) {
         idleCountRef.current += 1
@@ -538,8 +648,6 @@ function App() {
           tiltAngleDegrees,
         })
       }
-
-      return
     }
   }
 
@@ -633,6 +741,7 @@ function App() {
     setEventLog([])
     eventIdRef.current = 1
     lastEventTimeRef.current = -999999
+    localStorage.removeItem(STORAGE_KEY)
   }
 
   function clearRejectionLog() {
@@ -642,7 +751,7 @@ function App() {
 
   return (
     <div>
-      <h1>AcuPill M8 Motor Telemetry Dashboard</h1>
+      <h1>AcuPill M9 Baseline Dashboard</h1>
 
       <h2>Device Status</h2>
       <p>{connected ? '🟢 CONNECTED' : '🔴 DISCONNECTED'}</p>
@@ -694,10 +803,79 @@ function App() {
         Reset State
       </button>
 
-      <h2>M8 Valid Medication Interaction Log</h2>
+      <h2>Latest Baseline Insight</h2>
+
+      <p
+        style={{
+          fontSize: '24px',
+          fontWeight: 'bold',
+        }}
+      >
+        {baselineInsight}
+      </p>
+
+      <p>
+        Experimental motor-pattern comparison only. Not a medical diagnosis.
+      </p>
+
+      {latestEvent && baseline && baseline.count >= 3 ? (
+        <div>
+          <p>
+            Duration change vs baseline:{' '}
+            {formatPercent(durationChange)}
+          </p>
+          <p>
+            Total motion change vs baseline:{' '}
+            {formatPercent(motionChange)}
+          </p>
+          <p>
+            Motion variability change vs baseline:{' '}
+            {formatPercent(variabilityChange)}
+          </p>
+        </div>
+      ) : (
+        <p>
+          Need at least 4 valid events total before comparison works well:
+          1 latest event + 3 previous baseline events.
+        </p>
+      )}
+
+      <h2>Personal Baseline</h2>
+
+      {baseline ? (
+        <table>
+          <thead>
+            <tr>
+              <th>Baseline events</th>
+              <th>Avg duration</th>
+              <th>Avg max tilt</th>
+              <th>Avg total motion</th>
+              <th>Avg motion</th>
+              <th>Avg peak motion</th>
+              <th>Avg variability</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            <tr>
+              <td>{baseline.count}</td>
+              <td>{baseline.durationMs.toFixed(0)} ms</td>
+              <td>{baseline.maxTiltAngle.toFixed(1)}°</td>
+              <td>{baseline.totalMotion.toFixed(3)}</td>
+              <td>{baseline.averageMotion.toFixed(3)}</td>
+              <td>{baseline.peakMotion.toFixed(3)}</td>
+              <td>{baseline.motionVariability.toFixed(3)}</td>
+            </tr>
+          </tbody>
+        </table>
+      ) : (
+        <p>No baseline yet. Complete several valid interactions.</p>
+      )}
+
+      <h2>M9 Valid Medication Interaction History</h2>
 
       {eventLog.length === 0 ? (
-        <p>No valid medication interaction detected yet.</p>
+        <p>No saved medication interactions yet.</p>
       ) : (
         <table>
           <thead>
@@ -739,7 +917,7 @@ function App() {
       )}
 
       <button onClick={clearEventLog} disabled={eventLog.length === 0}>
-        Clear Event Log
+        Clear Saved Event History
       </button>
 
       <h2>Rejected Interaction Log</h2>
@@ -815,10 +993,10 @@ function App() {
         </table>
       )}
 
-      <h2>M8 Success Check</h2>
+      <h2>M9 Success Check</h2>
       <p>
-        Every valid event should now include duration, max tilt, average tilt,
-        total motion, average motion, peak motion, variability, and sample count.
+        Events should stay after refresh, and the latest event should compare
+        against previous events as a simple baseline.
       </p>
     </div>
   )
