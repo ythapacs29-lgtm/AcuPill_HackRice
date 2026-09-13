@@ -10,7 +10,27 @@ const MIN_EVENT_DURATION_MS = 1000
 const MAX_EVENT_DURATION_MS = 15000
 const EVENT_COOLDOWN_MS = 4000
 
-const STORAGE_KEY = 'acupill_event_history_v1'
+const EVENT_STORAGE_KEY = 'acupill_event_history_v1'
+const SCHEDULE_STORAGE_KEY = 'acupill_schedule_v1'
+
+const EARLY_WINDOW_MINUTES = 30
+const RECORDED_WINDOW_MINUTES = 60
+const LATE_WINDOW_MINUTES = 180
+
+const DEFAULT_SCHEDULE = [
+  {
+    id: 1,
+    label: 'Morning medication',
+    time: '08:00',
+    enabled: true,
+  },
+  {
+    id: 2,
+    label: 'Evening medication',
+    time: '20:00',
+    enabled: true,
+  },
+]
 
 const ROTATING_TERMS = [
   'routine',
@@ -62,6 +82,7 @@ function angleBetweenVectorsDegrees(a, b) {
   if (magA === 0 || magB === 0) return 0
 
   let cosine = dot / (magA * magB)
+
   cosine = Math.max(-1, Math.min(1, cosine))
 
   return Math.acos(cosine) * (180 / Math.PI)
@@ -76,7 +97,11 @@ function averageSamples(samples) {
       ay: sum.ay + sample.ay,
       az: sum.az + sample.az,
     }),
-    { ax: 0, ay: 0, az: 0 }
+    {
+      ax: 0,
+      ay: 0,
+      az: 0,
+    }
   )
 
   return {
@@ -89,7 +114,7 @@ function averageSamples(samples) {
 function average(numbers) {
   if (numbers.length === 0) return 0
 
-  return numbers.reduce((sum, value) => sum + value, 0) / numbers.length
+  return numbers.reduce((total, value) => total + value, 0) / numbers.length
 }
 
 function sum(numbers) {
@@ -104,6 +129,7 @@ function standardDeviation(numbers) {
   const variance =
     numbers.reduce((total, value) => {
       const difference = value - avg
+
       return total + difference * difference
     }, 0) / numbers.length
 
@@ -112,7 +138,7 @@ function standardDeviation(numbers) {
 
 function loadSavedEvents() {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY)
+    const saved = localStorage.getItem(EVENT_STORAGE_KEY)
 
     if (!saved) return []
 
@@ -121,15 +147,50 @@ function loadSavedEvents() {
     return Array.isArray(parsed) ? parsed : []
   } catch (error) {
     console.error('Could not load saved events:', error)
+
     return []
   }
 }
 
 function saveEvents(events) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(events))
+    localStorage.setItem(
+      EVENT_STORAGE_KEY,
+      JSON.stringify(events)
+    )
   } catch (error) {
     console.error('Could not save events:', error)
+  }
+}
+
+function loadSchedule() {
+  try {
+    const saved = localStorage.getItem(SCHEDULE_STORAGE_KEY)
+
+    if (!saved) return DEFAULT_SCHEDULE
+
+    const parsed = JSON.parse(saved)
+
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return DEFAULT_SCHEDULE
+    }
+
+    return parsed
+  } catch (error) {
+    console.error('Could not load schedule:', error)
+
+    return DEFAULT_SCHEDULE
+  }
+}
+
+function saveSchedule(schedule) {
+  try {
+    localStorage.setItem(
+      SCHEDULE_STORAGE_KEY,
+      JSON.stringify(schedule)
+    )
+  } catch (error) {
+    console.error('Could not save schedule:', error)
   }
 }
 
@@ -173,6 +234,7 @@ function percentChange(latestValue, baselineValue) {
 
 function formatPercent(value) {
   const sign = value > 0 ? '+' : ''
+
   return `${sign}${value.toFixed(1)}%`
 }
 
@@ -188,11 +250,321 @@ function formatMs(value) {
   return `${value} ms`
 }
 
+function formatScheduleTime(time) {
+  if (!time) return '—'
+
+  const [hoursString, minutesString] = time.split(':')
+
+  let hours = Number(hoursString)
+  const minutes = Number(minutesString)
+
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) {
+    return time
+  }
+
+  const period = hours >= 12 ? 'PM' : 'AM'
+
+  hours %= 12
+
+  if (hours === 0) hours = 12
+
+  return `${hours}:${String(minutes).padStart(2, '0')} ${period}`
+}
+
+function getScheduleDate(baseDate, time) {
+  const [hours, minutes] = time.split(':').map(Number)
+
+  const date = new Date(baseDate)
+
+  date.setHours(hours, minutes, 0, 0)
+
+  return date
+}
+
+function startOfDay(date) {
+  const result = new Date(date)
+
+  result.setHours(0, 0, 0, 0)
+
+  return result
+}
+
+function addDays(date, numberOfDays) {
+  const result = new Date(date)
+
+  result.setDate(result.getDate() + numberOfDays)
+
+  return result
+}
+
+function isSameDay(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  )
+}
+
+function formatDayName(date) {
+  return date.toLocaleDateString(undefined, {
+    weekday: 'short',
+  })
+}
+
+function formatShortDate(date) {
+  return date.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+  })
+}
+
+function getEventDate(event) {
+  if (!event.recordedAtISO) return null
+
+  const date = new Date(event.recordedAtISO)
+
+  if (Number.isNaN(date.getTime())) return null
+
+  return date
+}
+
+function getNextMedication(schedule, now) {
+  const enabledSchedule = schedule
+    .filter((item) => item.enabled)
+    .sort((a, b) => a.time.localeCompare(b.time))
+
+  if (enabledSchedule.length === 0) return null
+
+  for (const item of enabledSchedule) {
+    const scheduledDate = getScheduleDate(now, item.time)
+
+    if (scheduledDate > now) {
+      return {
+        ...item,
+        scheduledDate,
+        isTomorrow: false,
+      }
+    }
+  }
+
+  const firstTomorrow = enabledSchedule[0]
+
+  const tomorrow = addDays(now, 1)
+
+  return {
+    ...firstTomorrow,
+
+    scheduledDate: getScheduleDate(
+      tomorrow,
+      firstTomorrow.time
+    ),
+
+    isTomorrow: true,
+  }
+}
+
+function buildScheduleStatusesForDate(
+  schedule,
+  events,
+  dayDate,
+  now
+) {
+  const activeSchedule = schedule
+    .filter((item) => item.enabled)
+    .sort((a, b) => a.time.localeCompare(b.time))
+
+  const usableEvents = events
+    .map((event) => ({
+      event,
+      date: getEventDate(event),
+    }))
+    .filter((entry) => entry.date)
+
+  const usedEventIds = new Set()
+
+  const todayStart = startOfDay(now)
+  const requestedDayStart = startOfDay(dayDate)
+
+  const requestedDayIsPast =
+    requestedDayStart.getTime() < todayStart.getTime()
+
+  const requestedDayIsFuture =
+    requestedDayStart.getTime() > todayStart.getTime()
+
+  return activeSchedule.map((item) => {
+    const scheduledDate = getScheduleDate(
+      dayDate,
+      item.time
+    )
+
+    const earlyStart = new Date(
+      scheduledDate.getTime() -
+        EARLY_WINDOW_MINUTES * 60 * 1000
+    )
+
+    const recordedEnd = new Date(
+      scheduledDate.getTime() +
+        RECORDED_WINDOW_MINUTES * 60 * 1000
+    )
+
+    const lateEnd = new Date(
+      scheduledDate.getTime() +
+        LATE_WINDOW_MINUTES * 60 * 1000
+    )
+
+    const matchingEvents = usableEvents
+      .filter(({ event, date }) => {
+        return (
+          !usedEventIds.has(event.id) &&
+          date >= earlyStart &&
+          date <= lateEnd
+        )
+      })
+      .sort((a, b) => {
+        const aDifference = Math.abs(
+          a.date.getTime() - scheduledDate.getTime()
+        )
+
+        const bDifference = Math.abs(
+          b.date.getTime() - scheduledDate.getTime()
+        )
+
+        return aDifference - bDifference
+      })
+
+    const matched = matchingEvents[0]
+
+    if (matched) {
+      usedEventIds.add(matched.event.id)
+
+      if (matched.date <= recordedEnd) {
+        return {
+          ...item,
+          scheduledDate,
+          status: 'recorded',
+          statusLabel: 'Recorded',
+          matchedEvent: matched.event,
+          matchedDate: matched.date,
+        }
+      }
+
+      return {
+        ...item,
+        scheduledDate,
+        status: 'late',
+        statusLabel: 'Recorded late',
+        matchedEvent: matched.event,
+        matchedDate: matched.date,
+      }
+    }
+
+    if (requestedDayIsFuture) {
+      return {
+        ...item,
+        scheduledDate,
+        status: 'upcoming',
+        statusLabel: 'Upcoming',
+        matchedEvent: null,
+      }
+    }
+
+    if (requestedDayIsPast) {
+      return {
+        ...item,
+        scheduledDate,
+        status: 'missing',
+        statusLabel: 'No interaction recorded',
+        matchedEvent: null,
+      }
+    }
+
+    if (now < scheduledDate) {
+      return {
+        ...item,
+        scheduledDate,
+        status: 'upcoming',
+        statusLabel: 'Upcoming',
+        matchedEvent: null,
+      }
+    }
+
+    if (now <= lateEnd) {
+      return {
+        ...item,
+        scheduledDate,
+        status: 'waiting',
+        statusLabel: 'No interaction recorded yet',
+        matchedEvent: null,
+      }
+    }
+
+    return {
+      ...item,
+      scheduledDate,
+      status: 'missing',
+      statusLabel: 'No interaction recorded',
+      matchedEvent: null,
+    }
+  })
+}
+
+function buildWeeklyRoutine(schedule, events, now) {
+  const days = []
+
+  for (let offset = 6; offset >= 0; offset -= 1) {
+    const date = addDays(startOfDay(now), -offset)
+
+    const statuses = buildScheduleStatusesForDate(
+      schedule,
+      events,
+      date,
+      now
+    )
+
+    const recorded = statuses.filter(
+      (item) => item.status === 'recorded'
+    ).length
+
+    const late = statuses.filter(
+      (item) => item.status === 'late'
+    ).length
+
+    const missing = statuses.filter(
+      (item) => item.status === 'missing'
+    ).length
+
+    const waiting = statuses.filter(
+      (item) =>
+        item.status === 'waiting' ||
+        item.status === 'upcoming'
+    ).length
+
+    const completed = recorded + late
+
+    days.push({
+      date,
+      statuses,
+      scheduled: statuses.length,
+      recorded,
+      late,
+      missing,
+      waiting,
+      completed,
+    })
+  }
+
+  return days
+}
+
 function LogoMark() {
   return (
     <div className="logo-lockup">
       <div className="logo-icon" aria-hidden="true">
-        <svg viewBox="0 0 64 64" width="46" height="46">
+        <svg
+          viewBox="0 0 64 64"
+          width="46"
+          height="46"
+        >
           <rect
             x="10"
             y="18"
@@ -223,7 +595,9 @@ function LogoMark() {
       </div>
 
       <div>
-        <p className="eyebrow">Medication support between appointments</p>
+        <p className="eyebrow">
+          Medication support between appointments
+        </p>
 
         <h1 className="brand-title">
           <span>Acu</span>
@@ -234,131 +608,288 @@ function LogoMark() {
   )
 }
 
-function MetricCard({ label, value, subtext }) {
+function MetricCard({
+  label,
+  value,
+  subtext,
+}) {
   return (
     <div className="metric-card">
-      <p className="metric-label">{label}</p>
+      <p className="metric-label">
+        {label}
+      </p>
 
-      <p key={String(value)} className="metric-value tick">
+      <p
+        key={String(value)}
+        className="metric-value tick"
+      >
         {value}
       </p>
 
-      {subtext ? <p className="metric-subtext">{subtext}</p> : null}
+      {subtext ? (
+        <p className="metric-subtext">
+          {subtext}
+        </p>
+      ) : null}
     </div>
   )
 }
 
 function App() {
-  /* =========================================================
-     ROLE / LOGIN STATE
-     ========================================================= */
+  const [session, setSession] =
+    useState(null)
 
-  const [session, setSession] = useState(null)
-  const [loginRole, setLoginRole] = useState('patient')
-  const [loginEmail, setLoginEmail] = useState('')
-  const [loginPassword, setLoginPassword] = useState('')
+  const [loginRole, setLoginRole] =
+    useState('patient')
 
-  /* =========================================================
-     DEVICE STATE
-     ========================================================= */
+  const [loginEmail, setLoginEmail] =
+    useState('')
 
-  const [connected, setConnected] = useState(false)
-  const [lastLine, setLastLine] = useState('No data yet')
+  const [
+    loginPassword,
+    setLoginPassword,
+  ] = useState('')
 
-  const [sensorData, setSensorData] = useState({
-    t_ms: 0,
-    touch: 0,
-    ax: 0,
-    ay: 0,
-    az: 0,
-  })
+  const [schedule, setSchedule] =
+    useState(() => loadSchedule())
 
-  const [movementState, setMovementState] = useState('IDLE')
+  const [now, setNow] =
+    useState(() => new Date())
 
-  const [restBaseline, setRestBaseline] = useState({
-    ax: 0,
-    ay: 1,
-    az: 0,
-  })
+  const [connected, setConnected] =
+    useState(false)
 
-  const [debug, setDebug] = useState({
-    tiltAngleDegrees: 0,
-    motionAmount: 0,
-    isTilted: false,
-    isMoving: false,
-    isAtRest: false,
-    cooldownActive: false,
-  })
+  const [lastLine, setLastLine] =
+    useState('No data yet')
 
-  const [stateHistory, setStateHistory] = useState([])
-  const [eventLog, setEventLog] = useState(() => loadSavedEvents())
-  const [rejectionLog, setRejectionLog] = useState([])
-  const [rotatingTermIndex, setRotatingTermIndex] = useState(0)
+  const [sensorData, setSensorData] =
+    useState({
+      t_ms: 0,
+      touch: 0,
+      ax: 0,
+      ay: 0,
+      az: 0,
+    })
 
-  /* =========================================================
-     REFS
-     ========================================================= */
+  const [
+    movementState,
+    setMovementState,
+  ] = useState('IDLE')
 
-  const restBaselineRef = useRef({
+  const [
+    restBaseline,
+    setRestBaseline,
+  ] = useState({
     ax: 0,
     ay: 1,
     az: 0,
   })
 
-  const recentSamplesRef = useRef([])
-  const previousDataRef = useRef(null)
+  const [debug, setDebug] =
+    useState({
+      tiltAngleDegrees: 0,
+      motionAmount: 0,
+      isTilted: false,
+      isMoving: false,
+      isAtRest: false,
+      cooldownActive: false,
+    })
 
-  const movementStateRef = useRef('IDLE')
-  const stateStartedAtRef = useRef(0)
+  const [
+    stateHistory,
+    setStateHistory,
+  ] = useState([])
 
-  const handlingCountRef = useRef(0)
-  const tiltCountRef = useRef(0)
-  const returnCountRef = useRef(0)
-  const idleCountRef = useRef(0)
+  const [eventLog, setEventLog] =
+    useState(() => loadSavedEvents())
 
-  const currentInteractionRef = useRef(null)
-  const eventAlreadyDecidedRef = useRef(false)
+  const [
+    rejectionLog,
+    setRejectionLog,
+  ] = useState([])
+
+  const [
+    rotatingTermIndex,
+    setRotatingTermIndex,
+  ] = useState(0)
+
+  const restBaselineRef =
+    useRef({
+      ax: 0,
+      ay: 1,
+      az: 0,
+    })
+
+  const recentSamplesRef =
+    useRef([])
+
+  const previousDataRef =
+    useRef(null)
+
+  const movementStateRef =
+    useRef('IDLE')
+
+  const stateStartedAtRef =
+    useRef(0)
+
+  const handlingCountRef =
+    useRef(0)
+
+  const tiltCountRef =
+    useRef(0)
+
+  const returnCountRef =
+    useRef(0)
+
+  const idleCountRef =
+    useRef(0)
+
+  const currentInteractionRef =
+    useRef(null)
+
+  const eventAlreadyDecidedRef =
+    useRef(false)
 
   const eventIdRef = useRef(
     eventLog.length > 0
-      ? Math.max(...eventLog.map((event) => Number(event.id) || 0)) + 1
+      ? Math.max(
+          ...eventLog.map(
+            (event) =>
+              Number(event.id) || 0
+          )
+        ) + 1
       : 1
   )
 
-  const rejectionIdRef = useRef(1)
-  const lastEventTimeRef = useRef(-999999)
+  const rejectionIdRef =
+    useRef(1)
 
-  /* =========================================================
-     EFFECTS
-     ========================================================= */
+  const lastEventTimeRef =
+    useRef(-999999)
 
   useEffect(() => {
     saveEvents(eventLog)
   }, [eventLog])
 
   useEffect(() => {
-    const interval = setInterval(() => {
-      setRotatingTermIndex(
-        (previous) => (previous + 1) % ROTATING_TERMS.length
-      )
-    }, 2300)
+    saveSchedule(schedule)
+  }, [schedule])
 
-    return () => clearInterval(interval)
+  useEffect(() => {
+    const interval =
+      setInterval(() => {
+        setRotatingTermIndex(
+          (previous) =>
+            (previous + 1) %
+            ROTATING_TERMS.length
+        )
+      }, 2300)
+
+    return () =>
+      clearInterval(interval)
   }, [])
 
-  /* =========================================================
-     ANALYTICS
-     ========================================================= */
+  useEffect(() => {
+    const interval =
+      setInterval(() => {
+        setNow(new Date())
+      }, 30000)
 
-  const latestEvent = eventLog[0] || null
-  const baselineEvents = eventLog.slice(1)
-  const baseline = calculateBaseline(baselineEvents)
+    return () =>
+      clearInterval(interval)
+  }, [])
 
-  const todayDate = new Date().toLocaleDateString()
+  const nextMedication =
+    getNextMedication(
+      schedule,
+      now
+    )
 
-  const todayEvents = eventLog.filter(
-    (event) => event.recordedDate === todayDate
-  )
+  const todayRoutine =
+    buildScheduleStatusesForDate(
+      schedule,
+      eventLog,
+      now,
+      now
+    )
+
+  const weeklyRoutine =
+    buildWeeklyRoutine(
+      schedule,
+      eventLog,
+      now
+    )
+
+  const weeklyTotals =
+    weeklyRoutine.reduce(
+      (totals, day) => {
+        return {
+          scheduled:
+            totals.scheduled +
+            day.scheduled,
+
+          recorded:
+            totals.recorded +
+            day.recorded,
+
+          late:
+            totals.late +
+            day.late,
+
+          missing:
+            totals.missing +
+            day.missing,
+
+          pending:
+            totals.pending +
+            day.waiting,
+        }
+      },
+      {
+        scheduled: 0,
+        recorded: 0,
+        late: 0,
+        missing: 0,
+        pending: 0,
+      }
+    )
+
+  const todayCompleted =
+    todayRoutine.filter(
+      (item) =>
+        item.status === 'recorded' ||
+        item.status === 'late'
+    ).length
+
+  function updateScheduleItem(
+    id,
+    field,
+    value
+  ) {
+    setSchedule(
+      (oldSchedule) =>
+        oldSchedule.map(
+          (item) =>
+            item.id === id
+              ? {
+                  ...item,
+                  [field]: value,
+                }
+              : item
+        )
+    )
+  }
+
+  const latestEvent =
+    eventLog[0] || null
+
+  const baselineEvents =
+    eventLog.slice(1)
+
+  const baseline =
+    calculateBaseline(
+      baselineEvents
+    )
 
   let durationChange = 0
   let motionChange = 0
@@ -369,33 +900,45 @@ function App() {
 
   let insightTone = 'neutral'
 
-  if (latestEvent && baseline && baseline.count >= 3) {
-    durationChange = percentChange(
-      latestEvent.durationMs,
-      baseline.durationMs
-    )
+  if (
+    latestEvent &&
+    baseline &&
+    baseline.count >= 3
+  ) {
+    durationChange =
+      percentChange(
+        latestEvent.durationMs,
+        baseline.durationMs
+      )
 
-    motionChange = percentChange(
-      latestEvent.totalMotion,
-      baseline.totalMotion
-    )
+    motionChange =
+      percentChange(
+        latestEvent.totalMotion,
+        baseline.totalMotion
+      )
 
-    variabilityChange = percentChange(
-      latestEvent.motionVariability,
-      baseline.motionVariability
-    )
+    variabilityChange =
+      percentChange(
+        latestEvent.motionVariability,
+        baseline.motionVariability
+      )
 
     if (durationChange > 25) {
       baselineInsight =
         'Latest interaction was slower than the personal baseline.'
 
       insightTone = 'warning'
-    } else if (motionChange > 25 || variabilityChange > 25) {
+    } else if (
+      motionChange > 25 ||
+      variabilityChange > 25
+    ) {
       baselineInsight =
         'Latest interaction showed more movement variation than baseline.'
 
       insightTone = 'warning'
-    } else if (durationChange < -25) {
+    } else if (
+      durationChange < -25
+    ) {
       baselineInsight =
         'Latest interaction was faster than the personal baseline.'
 
@@ -411,22 +954,31 @@ function App() {
   let patientMovementStatus =
     'Building your recent movement pattern.'
 
-  if (latestEvent && baseline && baseline.count >= 3) {
-    const variabilityDifference = Math.abs(
-      percentChange(
-        latestEvent.motionVariability,
-        baseline.motionVariability
+  if (
+    latestEvent &&
+    baseline &&
+    baseline.count >= 3
+  ) {
+    const variabilityDifference =
+      Math.abs(
+        percentChange(
+          latestEvent.motionVariability,
+          baseline.motionVariability
+        )
       )
-    )
 
-    const motionDifference = Math.abs(
-      percentChange(
-        latestEvent.totalMotion,
-        baseline.totalMotion
+    const motionDifference =
+      Math.abs(
+        percentChange(
+          latestEvent.totalMotion,
+          baseline.totalMotion
+        )
       )
-    )
 
-    if (variabilityDifference > 25 || motionDifference > 30) {
+    if (
+      variabilityDifference > 25 ||
+      motionDifference > 30
+    ) {
       patientMovementStatus =
         'Your recent movement pattern has been a little different from usual.'
     } else {
@@ -435,27 +987,16 @@ function App() {
     }
   }
 
-  const rotatingTerm = ROTATING_TERMS[rotatingTermIndex]
-
-  /* =========================================================
-     LOGIN
-     ========================================================= */
+  const rotatingTerm =
+    ROTATING_TERMS[
+      rotatingTermIndex
+    ]
 
   function handleLogin(event) {
     event.preventDefault()
 
-    /*
-      DEMO AUTHENTICATION ONLY.
-
-      We intentionally do NOT store email/password.
-
-      Later:
-      - real authentication
-      - backend
-      - Tiger Data
-    */
-
     setSession(loginRole)
+
     setLoginPassword('')
   }
 
@@ -464,10 +1005,6 @@ function App() {
     setLoginPassword('')
   }
 
-  /* =========================================================
-     DETECTION ENGINE
-     ========================================================= */
-
   function resetCounters() {
     handlingCountRef.current = 0
     tiltCountRef.current = 0
@@ -475,82 +1012,141 @@ function App() {
     idleCountRef.current = 0
   }
 
-  function calculateMotorTelemetry(interaction, endTime) {
-    const samples = interaction.samples
+  function calculateMotorTelemetry(
+    interaction,
+    endTime
+  ) {
+    const samples =
+      interaction.samples
 
-    const motionValues = samples.map(
-      (sample) => sample.motionAmount
-    )
+    const motionValues =
+      samples.map(
+        (sample) =>
+          sample.motionAmount
+      )
 
-    const tiltValues = samples.map(
-      (sample) => sample.tiltAngleDegrees
-    )
+    const tiltValues =
+      samples.map(
+        (sample) =>
+          sample.tiltAngleDegrees
+      )
 
-    const durationMs = endTime - interaction.startTime
+    const durationMs =
+      endTime -
+      interaction.startTime
 
     return {
       durationMs,
-      sampleCount: samples.length,
 
-      maxTiltAngle: Math.max(...tiltValues, 0),
+      sampleCount:
+        samples.length,
 
-      averageTiltAngle: average(tiltValues),
+      maxTiltAngle:
+        Math.max(
+          ...tiltValues,
+          0
+        ),
 
-      totalMotion: sum(motionValues),
+      averageTiltAngle:
+        average(tiltValues),
 
-      averageMotion: average(motionValues),
+      totalMotion:
+        sum(motionValues),
 
-      peakMotion: Math.max(...motionValues, 0),
+      averageMotion:
+        average(motionValues),
 
-      motionVariability: standardDeviation(motionValues),
+      peakMotion:
+        Math.max(
+          ...motionValues,
+          0
+        ),
+
+      motionVariability:
+        standardDeviation(
+          motionValues
+        ),
     }
   }
 
-  function addRejectedInteraction(t_ms, reason, interaction) {
-    const telemetry = interaction
-      ? calculateMotorTelemetry(interaction, t_ms)
-      : {
-          durationMs: 0,
-          maxTiltAngle: 0,
-        }
+  function addRejectedInteraction(
+    t_ms,
+    reason,
+    interaction
+  ) {
+    const telemetry =
+      interaction
+        ? calculateMotorTelemetry(
+            interaction,
+            t_ms
+          )
+        : {
+            durationMs: 0,
+            maxTiltAngle: 0,
+          }
 
     const rejection = {
-      id: rejectionIdRef.current,
+      id:
+        rejectionIdRef.current,
 
-      arduinoTime: t_ms,
+      arduinoTime:
+        t_ms,
 
       reason,
 
-      durationMs: telemetry.durationMs,
+      durationMs:
+        telemetry.durationMs,
 
-      touchSeen: interaction ? interaction.touchSeen : false,
+      touchSeen:
+        interaction
+          ? interaction.touchSeen
+          : false,
 
-      maxTiltAngle: telemetry.maxTiltAngle,
+      maxTiltAngle:
+        telemetry.maxTiltAngle,
 
-      clockTime: new Date().toLocaleTimeString(),
+      clockTime:
+        new Date().toLocaleTimeString(),
     }
 
     rejectionIdRef.current += 1
 
-    setRejectionLog((oldRejections) => {
-      return [rejection, ...oldRejections].slice(0, 8)
-    })
+    setRejectionLog(
+      (oldRejections) => [
+        rejection,
+        ...oldRejections,
+      ].slice(0, 8)
+    )
   }
 
-  function tryLogMedicationInteraction(t_ms) {
-    if (eventAlreadyDecidedRef.current) return
+  function tryLogMedicationInteraction(
+    t_ms
+  ) {
+    if (
+      eventAlreadyDecidedRef.current
+    ) {
+      return
+    }
 
-    const interaction = currentInteractionRef.current
+    const interaction =
+      currentInteractionRef.current
 
     if (!interaction) return
 
-    const telemetry = calculateMotorTelemetry(interaction, t_ms)
+    const telemetry =
+      calculateMotorTelemetry(
+        interaction,
+        t_ms
+      )
 
     const cooldownActive =
-      t_ms - lastEventTimeRef.current < EVENT_COOLDOWN_MS
+      t_ms -
+        lastEventTimeRef.current <
+      EVENT_COOLDOWN_MS
 
     if (cooldownActive) {
-      eventAlreadyDecidedRef.current = true
+      eventAlreadyDecidedRef.current =
+        true
 
       addRejectedInteraction(
         t_ms,
@@ -562,7 +1158,8 @@ function App() {
     }
 
     if (!interaction.touchSeen) {
-      eventAlreadyDecidedRef.current = true
+      eventAlreadyDecidedRef.current =
+        true
 
       addRejectedInteraction(
         t_ms,
@@ -573,8 +1170,12 @@ function App() {
       return
     }
 
-    if (telemetry.maxTiltAngle < TILT_THRESHOLD_DEGREES) {
-      eventAlreadyDecidedRef.current = true
+    if (
+      telemetry.maxTiltAngle <
+      TILT_THRESHOLD_DEGREES
+    ) {
+      eventAlreadyDecidedRef.current =
+        true
 
       addRejectedInteraction(
         t_ms,
@@ -585,8 +1186,12 @@ function App() {
       return
     }
 
-    if (telemetry.durationMs < MIN_EVENT_DURATION_MS) {
-      eventAlreadyDecidedRef.current = true
+    if (
+      telemetry.durationMs <
+      MIN_EVENT_DURATION_MS
+    ) {
+      eventAlreadyDecidedRef.current =
+        true
 
       addRejectedInteraction(
         t_ms,
@@ -597,8 +1202,12 @@ function App() {
       return
     }
 
-    if (telemetry.durationMs > MAX_EVENT_DURATION_MS) {
-      eventAlreadyDecidedRef.current = true
+    if (
+      telemetry.durationMs >
+      MAX_EVENT_DURATION_MS
+    ) {
+      eventAlreadyDecidedRef.current =
+        true
 
       addRejectedInteraction(
         t_ms,
@@ -609,94 +1218,150 @@ function App() {
       return
     }
 
-    const now = new Date()
+    const eventTime =
+      new Date()
 
-    const event = {
-      id: eventIdRef.current,
+    const medicationEvent = {
+      id:
+        eventIdRef.current,
 
-      arduinoTime: t_ms,
+      arduinoTime:
+        t_ms,
 
-      recordedAtISO: now.toISOString(),
+      recordedAtISO:
+        eventTime.toISOString(),
 
-      recordedDate: now.toLocaleDateString(),
+      recordedDate:
+        eventTime.toLocaleDateString(),
 
-      clockTime: now.toLocaleTimeString(),
+      clockTime:
+        eventTime.toLocaleTimeString(),
 
-      touchSeen: interaction.touchSeen,
+      touchSeen:
+        interaction.touchSeen,
 
       ...telemetry,
     }
 
     eventIdRef.current += 1
 
-    lastEventTimeRef.current = t_ms
+    lastEventTimeRef.current =
+      t_ms
 
-    eventAlreadyDecidedRef.current = true
+    eventAlreadyDecidedRef.current =
+      true
 
-    setEventLog((oldEvents) => {
-      return [event, ...oldEvents].slice(0, 20)
-    })
+    setEventLog(
+      (oldEvents) => [
+        medicationEvent,
+        ...oldEvents,
+      ].slice(0, 100)
+    )
   }
 
-  function changeState(newState, t_ms, context = {}) {
-    const oldState = movementStateRef.current
+  function changeState(
+    newState,
+    t_ms,
+    context = {}
+  ) {
+    const oldState =
+      movementStateRef.current
 
-    if (oldState === newState) return
+    if (oldState === newState) {
+      return
+    }
 
-    movementStateRef.current = newState
-    stateStartedAtRef.current = t_ms
+    movementStateRef.current =
+      newState
+
+    stateStartedAtRef.current =
+      t_ms
 
     setMovementState(newState)
 
     resetCounters()
 
-    if (oldState === 'IDLE' && newState === 'HANDLING') {
+    if (
+      oldState === 'IDLE' &&
+      newState === 'HANDLING'
+    ) {
       currentInteractionRef.current = {
         startTime: t_ms,
-        touchSeen: context.touch === 1,
+        touchSeen:
+          context.touch === 1,
         samples: [],
       }
 
-      eventAlreadyDecidedRef.current = false
+      eventAlreadyDecidedRef.current =
+        false
     }
 
-    if (oldState === 'TILTED' && newState === 'RETURNED') {
-      tryLogMedicationInteraction(t_ms)
+    if (
+      oldState === 'TILTED' &&
+      newState === 'RETURNED'
+    ) {
+      tryLogMedicationInteraction(
+        t_ms
+      )
     }
 
-    if (oldState === 'RETURNED' && newState === 'IDLE') {
-      currentInteractionRef.current = null
-      eventAlreadyDecidedRef.current = false
+    if (
+      oldState === 'RETURNED' &&
+      newState === 'IDLE'
+    ) {
+      currentInteractionRef.current =
+        null
+
+      eventAlreadyDecidedRef.current =
+        false
     }
 
-    setStateHistory((oldHistory) => {
-      return [
+    setStateHistory(
+      (oldHistory) => [
         {
           state: newState,
           time: t_ms,
         },
         ...oldHistory,
       ].slice(0, 10)
-    })
+    )
   }
 
   function calibrateRest() {
-    const newBaseline = averageSamples(recentSamplesRef.current)
+    const newBaseline =
+      averageSamples(
+        recentSamplesRef.current
+      )
 
     if (!newBaseline) {
-      alert('No samples yet. Connect Arduino first.')
+      alert(
+        'No samples yet. Connect Arduino first.'
+      )
+
       return
     }
 
-    restBaselineRef.current = newBaseline
-    setRestBaseline(newBaseline)
+    restBaselineRef.current =
+      newBaseline
 
-    movementStateRef.current = 'IDLE'
-    stateStartedAtRef.current = sensorData.t_ms
+    setRestBaseline(
+      newBaseline
+    )
 
-    previousDataRef.current = null
-    currentInteractionRef.current = null
-    eventAlreadyDecidedRef.current = false
+    movementStateRef.current =
+      'IDLE'
+
+    stateStartedAtRef.current =
+      sensorData.t_ms
+
+    previousDataRef.current =
+      null
+
+    currentInteractionRef.current =
+      null
+
+    eventAlreadyDecidedRef.current =
+      false
 
     resetCounters()
 
@@ -705,13 +1370,22 @@ function App() {
     setStateHistory([
       {
         state: 'IDLE',
-        time: sensorData.t_ms,
+        time:
+          sensorData.t_ms,
       },
     ])
   }
 
-  function updateMovementState(data) {
-    const { t_ms, touch, ax, ay, az } = data
+  function updateMovementState(
+    data
+  ) {
+    const {
+      t_ms,
+      touch,
+      ax,
+      ay,
+      az,
+    } = data
 
     const currentVector = {
       ax,
@@ -719,53 +1393,74 @@ function App() {
       az,
     }
 
-    const tiltAngleDegrees = angleBetweenVectorsDegrees(
-      restBaselineRef.current,
-      currentVector
-    )
+    const tiltAngleDegrees =
+      angleBetweenVectorsDegrees(
+        restBaselineRef.current,
+        currentVector
+      )
 
-    const previousData = previousDataRef.current
+    const previousData =
+      previousDataRef.current
 
     let motionAmount = 0
 
     if (previousData) {
       motionAmount =
-        Math.abs(ax - previousData.ax) +
-        Math.abs(ay - previousData.ay) +
-        Math.abs(az - previousData.az)
+        Math.abs(
+          ax - previousData.ax
+        ) +
+        Math.abs(
+          ay - previousData.ay
+        ) +
+        Math.abs(
+          az - previousData.az
+        )
     }
 
-    previousDataRef.current = data
+    previousDataRef.current =
+      data
 
     const isTilted =
-      tiltAngleDegrees > TILT_THRESHOLD_DEGREES
+      tiltAngleDegrees >
+      TILT_THRESHOLD_DEGREES
 
     const isMoving =
-      motionAmount > MOTION_THRESHOLD
+      motionAmount >
+      MOTION_THRESHOLD
 
     const isAtRest =
-      tiltAngleDegrees < REST_THRESHOLD_DEGREES && !isMoving
+      tiltAngleDegrees <
+        REST_THRESHOLD_DEGREES &&
+      !isMoving
 
     const isReturned =
-      tiltAngleDegrees < RETURN_THRESHOLD_DEGREES
+      tiltAngleDegrees <
+      RETURN_THRESHOLD_DEGREES
 
     const cooldownActive =
-      t_ms - lastEventTimeRef.current < EVENT_COOLDOWN_MS
+      t_ms -
+        lastEventTimeRef.current <
+      EVENT_COOLDOWN_MS
 
-    if (currentInteractionRef.current) {
+    if (
+      currentInteractionRef.current
+    ) {
       if (touch === 1) {
-        currentInteractionRef.current.touchSeen = true
+        currentInteractionRef.current.touchSeen =
+          true
       }
 
-      currentInteractionRef.current.samples.push({
-        t_ms,
-        touch,
-        ax,
-        ay,
-        az,
-        tiltAngleDegrees,
-        motionAmount,
-      })
+      currentInteractionRef.current.samples.push(
+        {
+          t_ms,
+          touch,
+          ax,
+          ay,
+          az,
+          tiltAngleDegrees,
+          motionAmount,
+        }
+      )
     }
 
     setDebug({
@@ -777,32 +1472,46 @@ function App() {
       cooldownActive,
     })
 
-    const currentState = movementStateRef.current
+    const currentState =
+      movementStateRef.current
 
     const timeInCurrentState =
-      t_ms - stateStartedAtRef.current
+      t_ms -
+      stateStartedAtRef.current
 
-    if (currentState === 'IDLE') {
+    if (
+      currentState === 'IDLE'
+    ) {
       if (
         isMoving ||
-        tiltAngleDegrees > REST_THRESHOLD_DEGREES
+        tiltAngleDegrees >
+          REST_THRESHOLD_DEGREES
       ) {
         handlingCountRef.current += 1
       } else {
         handlingCountRef.current = 0
       }
 
-      if (handlingCountRef.current >= 2 || isTilted) {
-        changeState('HANDLING', t_ms, {
-          touch,
-          tiltAngleDegrees,
-        })
+      if (
+        handlingCountRef.current >= 2 ||
+        isTilted
+      ) {
+        changeState(
+          'HANDLING',
+          t_ms,
+          {
+            touch,
+            tiltAngleDegrees,
+          }
+        )
       }
 
       return
     }
 
-    if (currentState === 'HANDLING') {
+    if (
+      currentState === 'HANDLING'
+    ) {
       if (isTilted) {
         tiltCountRef.current += 1
       } else {
@@ -813,29 +1522,44 @@ function App() {
         timeInCurrentState >= 500 &&
         tiltCountRef.current >= 1
       ) {
-        changeState('TILTED', t_ms, {
-          touch,
-          tiltAngleDegrees,
-        })
+        changeState(
+          'TILTED',
+          t_ms,
+          {
+            touch,
+            tiltAngleDegrees,
+          }
+        )
       }
 
-      if (isAtRest && touch === 0) {
+      if (
+        isAtRest &&
+        touch === 0
+      ) {
         idleCountRef.current += 1
       } else {
         idleCountRef.current = 0
       }
 
-      if (idleCountRef.current >= 5) {
-        changeState('IDLE', t_ms, {
-          touch,
-          tiltAngleDegrees,
-        })
+      if (
+        idleCountRef.current >= 5
+      ) {
+        changeState(
+          'IDLE',
+          t_ms,
+          {
+            touch,
+            tiltAngleDegrees,
+          }
+        )
       }
 
       return
     }
 
-    if (currentState === 'TILTED') {
+    if (
+      currentState === 'TILTED'
+    ) {
       if (isReturned) {
         returnCountRef.current += 1
       } else {
@@ -846,17 +1570,26 @@ function App() {
         timeInCurrentState >= 500 &&
         returnCountRef.current >= 2
       ) {
-        changeState('RETURNED', t_ms, {
-          touch,
-          tiltAngleDegrees,
-        })
+        changeState(
+          'RETURNED',
+          t_ms,
+          {
+            touch,
+            tiltAngleDegrees,
+          }
+        )
       }
 
       return
     }
 
-    if (currentState === 'RETURNED') {
-      if (isAtRest && touch === 0) {
+    if (
+      currentState === 'RETURNED'
+    ) {
+      if (
+        isAtRest &&
+        touch === 0
+      ) {
         idleCountRef.current += 1
       } else {
         idleCountRef.current = 0
@@ -866,26 +1599,30 @@ function App() {
         timeInCurrentState >= 1000 &&
         idleCountRef.current >= 3
       ) {
-        changeState('IDLE', t_ms, {
-          touch,
-          tiltAngleDegrees,
-        })
+        changeState(
+          'IDLE',
+          t_ms,
+          {
+            touch,
+            tiltAngleDegrees,
+          }
+        )
       }
     }
   }
 
-  /* =========================================================
-     ARDUINO CONNECTION
-     ========================================================= */
-
   async function connectArduino() {
     if (!('serial' in navigator)) {
-      alert('Web Serial is not supported. Please use Google Chrome.')
+      alert(
+        'Web Serial is not supported. Please use Google Chrome.'
+      )
+
       return
     }
 
     try {
-      const port = await navigator.serial.requestPort()
+      const port =
+        await navigator.serial.requestPort()
 
       await port.open({
         baudRate: 115200,
@@ -893,44 +1630,66 @@ function App() {
 
       setConnected(true)
 
-      const decoder = new TextDecoderStream()
+      const decoder =
+        new TextDecoderStream()
 
-      port.readable.pipeTo(decoder.writable)
+      port.readable.pipeTo(
+        decoder.writable
+      )
 
-      const reader = decoder.readable.getReader()
+      const reader =
+        decoder.readable.getReader()
 
       let buffer = ''
 
       while (true) {
-        const { value, done } = await reader.read()
+        const {
+          value,
+          done,
+        } = await reader.read()
 
         if (done) break
 
         buffer += value
 
-        const lines = buffer.split('\n')
+        const lines =
+          buffer.split('\n')
 
-        buffer = lines.pop()
+        buffer =
+          lines.pop()
 
-        for (const line of lines) {
-          const cleanLine = line.trim()
+        for (
+          const line of lines
+        ) {
+          const cleanLine =
+            line.trim()
 
           if (!cleanLine) continue
 
-          setLastLine(cleanLine)
+          setLastLine(
+            cleanLine
+          )
 
-          const parsed = parseSensorLine(cleanLine)
+          const parsed =
+            parseSensorLine(
+              cleanLine
+            )
 
           if (!parsed) continue
 
-          setSensorData(parsed)
+          setSensorData(
+            parsed
+          )
 
-          recentSamplesRef.current = [
-            ...recentSamplesRef.current,
-            parsed,
-          ].slice(-12)
+          recentSamplesRef.current =
+            [
+              ...recentSamplesRef.current,
+              parsed,
+            ].slice(-12)
 
-          updateMovementState(parsed)
+          updateMovementState(
+            parsed
+          )
         }
       }
     } catch (error) {
@@ -945,13 +1704,20 @@ function App() {
   }
 
   function resetState() {
-    movementStateRef.current = 'IDLE'
+    movementStateRef.current =
+      'IDLE'
 
-    stateStartedAtRef.current = sensorData.t_ms
+    stateStartedAtRef.current =
+      sensorData.t_ms
 
-    previousDataRef.current = null
-    currentInteractionRef.current = null
-    eventAlreadyDecidedRef.current = false
+    previousDataRef.current =
+      null
+
+    currentInteractionRef.current =
+      null
+
+    eventAlreadyDecidedRef.current =
+      false
 
     resetCounters()
 
@@ -960,7 +1726,8 @@ function App() {
     setStateHistory([
       {
         state: 'IDLE',
-        time: sensorData.t_ms,
+        time:
+          sensorData.t_ms,
       },
     ])
   }
@@ -969,19 +1736,20 @@ function App() {
     setEventLog([])
 
     eventIdRef.current = 1
-    lastEventTimeRef.current = -999999
 
-    localStorage.removeItem(STORAGE_KEY)
+    lastEventTimeRef.current =
+      -999999
+
+    localStorage.removeItem(
+      EVENT_STORAGE_KEY
+    )
   }
 
   function clearRejectionLog() {
     setRejectionLog([])
+
     rejectionIdRef.current = 1
   }
-
-  /* =========================================================
-     LOGIN SCREEN
-     ========================================================= */
 
   if (!session) {
     return (
@@ -990,20 +1758,25 @@ function App() {
           <LogoMark />
 
           <div className="login-message">
-            <p className="login-kicker">Care between appointments</p>
+            <p className="login-kicker">
+              Care between appointments
+            </p>
 
             <h2>
               Medication support built around{' '}
-              <span className="rotating-login-word" key={rotatingTerm}>
+              <span
+                className="rotating-login-word"
+                key={rotatingTerm}
+              >
                 {rotatingTerm}
               </span>
               .
             </h2>
 
             <p>
-              AcuPill helps patients maintain their medication routine
-              while preserving meaningful movement and interaction history
-              for caregivers and clinicians.
+              AcuPill helps patients maintain their medication
+              routine while preserving meaningful movement and
+              interaction history for caregivers and clinicians.
             </p>
           </div>
 
@@ -1016,9 +1789,13 @@ function App() {
 
         <div className="login-form-panel">
           <div className="login-box">
-            <p className="eyebrow">Welcome to AcuPill</p>
+            <p className="eyebrow">
+              Welcome to AcuPill
+            </p>
 
-            <h2 className="login-heading">Sign in</h2>
+            <h2 className="login-heading">
+              Sign in
+            </h2>
 
             <p className="login-description">
               Choose how you use AcuPill.
@@ -1032,13 +1809,22 @@ function App() {
                     ? 'role-option active'
                     : 'role-option'
                 }
-                onClick={() => setLoginRole('patient')}
+                onClick={() =>
+                  setLoginRole('patient')
+                }
               >
-                <span className="role-icon">P</span>
+                <span className="role-icon">
+                  P
+                </span>
 
                 <span>
-                  <strong>Patient</strong>
-                  <small>My routine & support</small>
+                  <strong>
+                    Patient
+                  </strong>
+
+                  <small>
+                    My routine & support
+                  </small>
                 </span>
               </button>
 
@@ -1049,49 +1835,68 @@ function App() {
                     ? 'role-option active'
                     : 'role-option'
                 }
-                onClick={() => setLoginRole('caregiver')}
+                onClick={() =>
+                  setLoginRole('caregiver')
+                }
               >
-                <span className="role-icon">C</span>
+                <span className="role-icon">
+                  C
+                </span>
 
                 <span>
-                  <strong>Care Team / Clinic</strong>
-                  <small>Patient trends & insights</small>
+                  <strong>
+                    Care Team / Clinic
+                  </strong>
+
+                  <small>
+                    Patient trends & insights
+                  </small>
                 </span>
               </button>
             </div>
 
-            <form onSubmit={handleLogin} className="login-form">
+            <form
+              onSubmit={handleLogin}
+              className="login-form"
+            >
               <label>
                 Email
+
                 <input
                   type="email"
                   value={loginEmail}
                   onChange={(event) =>
-                    setLoginEmail(event.target.value)
+                    setLoginEmail(
+                      event.target.value
+                    )
                   }
                   placeholder={
                     loginRole === 'patient'
                       ? 'patient@example.com'
                       : 'clinician@clinic.com'
                   }
-                  autoComplete="email"
                 />
               </label>
 
               <label>
                 Password
+
                 <input
                   type="password"
                   value={loginPassword}
                   onChange={(event) =>
-                    setLoginPassword(event.target.value)
+                    setLoginPassword(
+                      event.target.value
+                    )
                   }
                   placeholder="••••••••"
-                  autoComplete="current-password"
                 />
               </label>
 
-              <button className="login-submit" type="submit">
+              <button
+                className="login-submit"
+                type="submit"
+              >
                 {loginRole === 'patient'
                   ? 'Continue to my dashboard'
                   : 'Continue to care dashboard'}
@@ -1099,14 +1904,16 @@ function App() {
             </form>
 
             <p className="demo-note">
-              Demo mode — authentication will be connected to the backend
-              later.
+              Demo mode — authentication will be connected to the
+              backend later.
             </p>
 
             <div className="engineering-access">
               <button
                 type="button"
-                onClick={() => setSession('engineering')}
+                onClick={() =>
+                  setSession('engineering')
+                }
               >
                 Engineering access
               </button>
@@ -1117,10 +1924,6 @@ function App() {
     )
   }
 
-  /* =========================================================
-     LOGGED-IN APP HEADER
-     ========================================================= */
-
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -1128,11 +1931,15 @@ function App() {
 
         <div className="app-header-right">
           {session === 'patient' && (
-            <span className="role-badge">Patient</span>
+            <span className="role-badge">
+              Patient
+            </span>
           )}
 
           {session === 'caregiver' && (
-            <span className="role-badge">Care Team / Clinic</span>
+            <span className="role-badge">
+              Care Team / Clinic
+            </span>
           )}
 
           {session === 'engineering' && (
@@ -1144,70 +1951,94 @@ function App() {
           {session === 'engineering' && (
             <div
               className={
-                connected ? 'status-pill good' : 'status-pill bad'
+                connected
+                  ? 'status-pill good'
+                  : 'status-pill bad'
               }
             >
-              <span className="pulse-dot"></span>
+              <span className="pulse-dot" />
 
-              {connected ? 'Connected' : 'Disconnected'}
+              {connected
+                ? 'Connected'
+                : 'Disconnected'}
             </div>
           )}
 
-          <button className="signout-button" onClick={signOut}>
+          <button
+            className="signout-button"
+            onClick={signOut}
+          >
             Sign out
           </button>
         </div>
       </header>
 
-      {/* =====================================================
-          PATIENT DASHBOARD
-          ===================================================== */}
-
       {session === 'patient' && (
-        <main className="dashboard-view patient-view">
+        <main className="dashboard-view">
           <section className="patient-welcome">
-            <p className="eyebrow">Patient support</p>
+            <p className="eyebrow">
+              Patient support
+            </p>
 
             <h2 className="patient-title">
               Your medication routine
             </h2>
 
             <p className="patient-intro">
-              AcuPill helps keep track of medication-bottle
-              interactions and remembers important changes between
-              appointments.
+              AcuPill helps track medication-bottle interactions
+              and remembers important changes between appointments.
             </p>
           </section>
 
           <section className="patient-grid">
             <div className="patient-feature">
-              <p className="card-label">Next medication</p>
+              <p className="card-label">
+                Next medication
+              </p>
+
+              {nextMedication ? (
+                <>
+                  <p className="patient-big-value">
+                    {formatScheduleTime(
+                      nextMedication.time
+                    )}
+                  </p>
+
+                  <p className="next-medication-label">
+                    {nextMedication.label}
+                  </p>
+
+                  <p className="patient-helper">
+                    {nextMedication.isTomorrow
+                      ? 'Tomorrow'
+                      : 'Today'}
+                  </p>
+                </>
+              ) : (
+                <p className="patient-big-value">
+                  No schedule
+                </p>
+              )}
+            </div>
+
+            <div className="patient-feature">
+              <p className="card-label">
+                Today's routine
+              </p>
 
               <p className="patient-big-value">
-                Schedule setup
+                {todayCompleted}/{todayRoutine.length}
               </p>
 
               <p className="patient-helper">
-                Medication scheduling is the next feature we will add.
+                scheduled bottle interactions recorded
               </p>
             </div>
 
             <div className="patient-feature">
-              <p className="card-label">Today's routine</p>
-
-              <p className="patient-big-value">
-                {todayEvents.length}
+              <p className="card-label">
+                Movement
               </p>
-
-              <p className="patient-helper">
-                {todayEvents.length === 1
-                  ? 'bottle interaction recorded today'
-                  : 'bottle interactions recorded today'}
-              </p>
-            </div>
-
-            <div className="patient-feature">
-              <p className="card-label">Movement</p>
 
               <p className="patient-status-text">
                 {patientMovementStatus}
@@ -1218,58 +2049,252 @@ function App() {
           <section className="patient-section">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Recent activity</p>
-                <h2>Bottle interactions</h2>
+                <p className="eyebrow">
+                  Today
+                </p>
+
+                <h2>
+                  Medication routine
+                </h2>
               </div>
             </div>
 
-            {todayEvents.length === 0 ? (
-              <div className="patient-message">
-                <strong>
-                  No medication-bottle interaction has been recorded
-                  today.
-                </strong>
+            <div className="dose-routine-list">
+              {todayRoutine.map((item) => (
+                <div
+                  className="dose-routine-row"
+                  key={item.id}
+                >
+                  <div className="dose-time">
+                    {formatScheduleTime(
+                      item.time
+                    )}
+                  </div>
 
-                <p>
-                  AcuPill records bottle handling rather than medication
-                  ingestion.
-                </p>
-              </div>
-            ) : (
-              <div className="patient-routine-list">
-                {todayEvents.slice(0, 5).map((event) => (
-                  <div
-                    key={event.id}
-                    className="patient-routine-row"
+                  <div className="dose-main">
+                    <strong>
+                      {item.label}
+                    </strong>
+
+                    {item.matchedDate ? (
+                      <p>
+                        Bottle interaction recorded at{' '}
+                        {item.matchedDate.toLocaleTimeString()}
+                      </p>
+                    ) : (
+                      <p>
+                        {item.status === 'upcoming'
+                          ? 'Scheduled for later today.'
+                          : item.status === 'waiting'
+                          ? 'No medication-bottle interaction has been recorded yet.'
+                          : 'No medication-bottle interaction was recorded during the monitoring window.'}
+                      </p>
+                    )}
+                  </div>
+
+                  <span
+                    className={`routine-status ${item.status}`}
                   >
-                    <div>
-                      <strong>Bottle interaction recorded</strong>
-                      <p>{event.clockTime}</p>
+                    {item.statusLabel}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <p className="schedule-note">
+              AcuPill detects medication-bottle interactions. It
+              does not confirm medication ingestion.
+            </p>
+          </section>
+
+          {/* NEW: PATIENT WEEKLY VIEW */}
+
+          <section className="patient-section">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Last 7 days
+                </p>
+
+                <h2>
+                  Your weekly routine
+                </h2>
+              </div>
+            </div>
+
+            <div className="patient-week-grid">
+              {weeklyRoutine.map((day) => {
+                const isToday =
+                  isSameDay(
+                    day.date,
+                    now
+                  )
+
+                return (
+                  <div
+                    className={
+                      isToday
+                        ? 'patient-week-day today'
+                        : 'patient-week-day'
+                    }
+                    key={day.date.toISOString()}
+                  >
+                    <p className="week-day-name">
+                      {formatDayName(
+                        day.date
+                      )}
+                    </p>
+
+                    <p className="week-day-date">
+                      {formatShortDate(
+                        day.date
+                      )}
+                    </p>
+
+                    <div className="week-score">
+                      {day.completed}/
+                      {day.scheduled}
                     </div>
 
-                    <span className="routine-confirmed">
-                      Recorded
-                    </span>
+                    <div className="week-status-line">
+                      <span
+                        className={
+                          day.scheduled > 0 &&
+                          day.completed === day.scheduled
+                            ? 'week-dot complete'
+                            : day.missing > 0
+                            ? 'week-dot different'
+                            : 'week-dot pending'
+                        }
+                      />
+
+                      <span>
+                        {day.scheduled === 0
+                          ? 'No schedule'
+                          : day.completed === day.scheduled
+                          ? 'Recorded'
+                          : day.missing > 0
+                          ? 'Some missing'
+                          : 'In progress'}
+                      </span>
+                    </div>
                   </div>
-                ))}
-              </div>
-            )}
+                )
+              })}
+            </div>
+
+            <p className="schedule-note">
+              This reflects recorded bottle interactions, not
+              confirmed medication ingestion.
+            </p>
           </section>
 
           <section className="patient-section">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Appointment memory</p>
-                <h2>Major changes</h2>
+                <p className="eyebrow">
+                  Settings
+                </p>
+
+                <h2>
+                  Medication schedule
+                </h2>
+              </div>
+            </div>
+
+            <div className="schedule-list">
+              {schedule.map((item) => (
+                <div
+                  className="schedule-row"
+                  key={item.id}
+                >
+                  <div className="schedule-enabled">
+                    <input
+                      type="checkbox"
+                      checked={item.enabled}
+                      onChange={(event) =>
+                        updateScheduleItem(
+                          item.id,
+                          'enabled',
+                          event.target.checked
+                        )
+                      }
+                    />
+                  </div>
+
+                  <div className="schedule-fields">
+                    <label>
+                      Medication
+
+                      <input
+                        type="text"
+                        value={item.label}
+                        onChange={(event) =>
+                          updateScheduleItem(
+                            item.id,
+                            'label',
+                            event.target.value
+                          )
+                        }
+                      />
+                    </label>
+
+                    <label>
+                      Time
+
+                      <input
+                        type="time"
+                        value={item.time}
+                        onChange={(event) =>
+                          updateScheduleItem(
+                            item.id,
+                            'time',
+                            event.target.value
+                          )
+                        }
+                      />
+                    </label>
+                  </div>
+
+                  <div className="schedule-preview">
+                    <strong>
+                      {formatScheduleTime(
+                        item.time
+                      )}
+                    </strong>
+
+                    <span>
+                      {item.enabled
+                        ? 'Active'
+                        : 'Paused'}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="patient-section">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Appointment memory
+                </p>
+
+                <h2>
+                  Major changes
+                </h2>
               </div>
             </div>
 
             <div className="patient-message">
-              <strong>No major changes have been saved yet.</strong>
+              <strong>
+                No major changes have been saved yet.
+              </strong>
 
               <p>
-                AcuPill will quietly watch for repeated changes and save
-                meaningful dates for your next appointment.
+                AcuPill will quietly watch for repeated changes and
+                preserve meaningful dates for your next appointment.
               </p>
             </div>
           </section>
@@ -1277,7 +2302,9 @@ function App() {
           <section className="patient-section">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Check-in</p>
+                <p className="eyebrow">
+                  Check-in
+                </p>
 
                 <h2>
                   How did handling your medication feel today?
@@ -1286,7 +2313,9 @@ function App() {
             </div>
 
             <div className="checkin-options">
-              <button className="checkin-button">Easy</button>
+              <button className="checkin-button">
+                Easy
+              </button>
 
               <button className="checkin-button">
                 A little difficult
@@ -1300,44 +2329,198 @@ function App() {
         </main>
       )}
 
-      {/* =====================================================
-          CAREGIVER / CLINICIAN DASHBOARD
-          ===================================================== */}
-
       {session === 'caregiver' && (
         <main className="dashboard-view">
           <section className="caregiver-summary">
             <div>
-              <p className="eyebrow">Caregiver / clinician</p>
+              <p className="eyebrow">
+                Caregiver / clinician
+              </p>
 
               <h2 className="caregiver-title">
                 Patient overview
               </h2>
 
               <p className="patient-intro">
-                Review medication interaction history and changes in
-                handling patterns over time.
+                Review medication interaction history and changes
+                in handling patterns over time.
               </p>
             </div>
 
             <div
               className={`caregiver-callout ${insightTone}`}
             >
-              <p className="card-label">Current insight</p>
+              <p className="card-label">
+                Current insight
+              </p>
 
-              <strong>{baselineInsight}</strong>
+              <strong>
+                {baselineInsight}
+              </strong>
 
               <p className="tiny-text">
-                Experimental comparison only. Not a medical diagnosis.
+                Experimental comparison only. Not a medical
+                diagnosis.
               </p>
+            </div>
+          </section>
+
+          {/* NEW: CAREGIVER 7 DAY SUMMARY */}
+
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Last 7 days
+                </p>
+
+                <h2>
+                  Medication interaction routine
+                </h2>
+              </div>
+            </div>
+
+            <div className="routine-summary-grid">
+              <MetricCard
+                label="Scheduled"
+                value={weeklyTotals.scheduled}
+              />
+
+              <MetricCard
+                label="Recorded"
+                value={weeklyTotals.recorded}
+              />
+
+              <MetricCard
+                label="Recorded late"
+                value={weeklyTotals.late}
+              />
+
+              <MetricCard
+                label="No interaction"
+                value={weeklyTotals.missing}
+              />
+            </div>
+
+            <div className="weekly-clinician-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Day</th>
+                    <th>Scheduled</th>
+                    <th>Recorded</th>
+                    <th>Late</th>
+                    <th>No interaction</th>
+                    <th>Pending</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {[...weeklyRoutine]
+                    .reverse()
+                    .map((day) => (
+                      <tr
+                        key={day.date.toISOString()}
+                      >
+                        <td>
+                          <strong>
+                            {formatDayName(
+                              day.date
+                            )}
+                          </strong>{' '}
+                          {formatShortDate(
+                            day.date
+                          )}
+                        </td>
+
+                        <td>
+                          {day.scheduled}
+                        </td>
+
+                        <td>
+                          {day.recorded}
+                        </td>
+
+                        <td>
+                          {day.late}
+                        </td>
+
+                        <td>
+                          {day.missing}
+                        </td>
+
+                        <td>
+                          {day.waiting}
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+
+            <p className="schedule-note">
+              These statuses describe recorded medication-bottle
+              interactions only.
+            </p>
+          </section>
+
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Today
+                </p>
+
+                <h2>
+                  Medication routine
+                </h2>
+              </div>
+            </div>
+
+            <div className="dose-routine-list">
+              {todayRoutine.map((item) => (
+                <div
+                  className="dose-routine-row"
+                  key={item.id}
+                >
+                  <div className="dose-time">
+                    {formatScheduleTime(
+                      item.time
+                    )}
+                  </div>
+
+                  <div className="dose-main">
+                    <strong>
+                      {item.label}
+                    </strong>
+
+                    <p>
+                      {item.matchedDate
+                        ? `Interaction: ${item.matchedDate.toLocaleTimeString()}`
+                        : 'No matched bottle interaction'}
+                    </p>
+                  </div>
+
+                  <span
+                    className={`routine-status ${item.status}`}
+                  >
+                    {item.statusLabel}
+                  </span>
+                </div>
+              ))}
             </div>
           </section>
 
           <section className="section-block">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Latest result</p>
-                <h2>Medication interaction</h2>
+                <p className="eyebrow">
+                  Latest result
+                </p>
+
+                <h2>
+                  Medication interaction
+                </h2>
               </div>
             </div>
 
@@ -1351,7 +2534,9 @@ function App() {
 
                 <MetricCard
                   label="Duration"
-                  value={formatMs(latestEvent.durationMs)}
+                  value={formatMs(
+                    latestEvent.durationMs
+                  )}
                 />
 
                 <MetricCard
@@ -1380,7 +2565,11 @@ function App() {
 
                 <MetricCard
                   label="Touch seen"
-                  value={latestEvent.touchSeen ? 'Yes' : 'No'}
+                  value={
+                    latestEvent.touchSeen
+                      ? 'Yes'
+                      : 'No'
+                  }
                 />
               </div>
             ) : (
@@ -1392,8 +2581,13 @@ function App() {
 
           <section className="section-block two-column">
             <div>
-              <p className="eyebrow">Personal baseline</p>
-              <h2>Normal handling pattern</h2>
+              <p className="eyebrow">
+                Personal baseline
+              </p>
+
+              <h2>
+                Normal handling pattern
+              </h2>
 
               {baseline ? (
                 <div className="mini-grid">
@@ -1404,58 +2598,87 @@ function App() {
 
                   <MetricCard
                     label="Avg duration"
-                    value={`${baseline.durationMs.toFixed(0)} ms`}
+                    value={`${baseline.durationMs.toFixed(
+                      0
+                    )} ms`}
                   />
 
                   <MetricCard
                     label="Avg max tilt"
-                    value={`${baseline.maxTiltAngle.toFixed(1)}°`}
+                    value={`${baseline.maxTiltAngle.toFixed(
+                      1
+                    )}°`}
                   />
 
                   <MetricCard
                     label="Avg motion"
-                    value={baseline.totalMotion.toFixed(3)}
+                    value={baseline.totalMotion.toFixed(
+                      3
+                    )}
                   />
 
                   <MetricCard
                     label="Avg variability"
-                    value={baseline.motionVariability.toFixed(3)}
+                    value={baseline.motionVariability.toFixed(
+                      3
+                    )}
                   />
                 </div>
               ) : (
                 <p>
-                  No baseline yet. Complete several valid interactions.
+                  No baseline yet. Complete several valid
+                  interactions.
                 </p>
               )}
             </div>
 
             <div>
-              <p className="eyebrow">Comparison</p>
-              <h2>Latest vs baseline</h2>
+              <p className="eyebrow">
+                Comparison
+              </p>
 
-              {latestEvent && baseline && baseline.count >= 3 ? (
+              <h2>
+                Latest vs baseline
+              </h2>
+
+              {latestEvent &&
+              baseline &&
+              baseline.count >= 3 ? (
                 <div className="comparison-list">
                   <p>
                     Duration change
-                    <strong>{formatPercent(durationChange)}</strong>
+
+                    <strong>
+                      {formatPercent(
+                        durationChange
+                      )}
+                    </strong>
                   </p>
 
                   <p>
                     Total motion change
-                    <strong>{formatPercent(motionChange)}</strong>
+
+                    <strong>
+                      {formatPercent(
+                        motionChange
+                      )}
+                    </strong>
                   </p>
 
                   <p>
                     Variability change
+
                     <strong>
-                      {formatPercent(variabilityChange)}
+                      {formatPercent(
+                        variabilityChange
+                      )}
                     </strong>
                   </p>
                 </div>
               ) : (
                 <p>
-                  At least four valid events are needed before baseline
-                  comparison is available.
+                  At least four valid events are needed before
+                  baseline comparison is available.
                 </p>
               )}
             </div>
@@ -1464,8 +2687,13 @@ function App() {
           <section className="section-block">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Longitudinal record</p>
-                <h2>Interaction history</h2>
+                <p className="eyebrow">
+                  Longitudinal record
+                </p>
+
+                <h2>
+                  Interaction history
+                </h2>
               </div>
 
               <button
@@ -1502,53 +2730,91 @@ function App() {
                   </thead>
 
                   <tbody>
-                    {eventLog.map((event, index) => (
-                      <tr
-                        key={event.id}
-                        className={index === 0 ? 'fresh' : ''}
-                      >
-                        <td>{event.id}</td>
+                    {eventLog.map(
+                      (event, index) => (
+                        <tr
+                          key={event.id}
+                          className={
+                            index === 0
+                              ? 'fresh'
+                              : ''
+                          }
+                        >
+                          <td>
+                            {event.id}
+                          </td>
 
-                        <td>
-                          {event.recordedDate || 'Older event'}
-                        </td>
+                          <td>
+                            {event.recordedDate ||
+                              'Older event'}
+                          </td>
 
-                        <td>{event.clockTime}</td>
+                          <td>
+                            {event.clockTime}
+                          </td>
 
-                        <td>{formatMs(event.durationMs)}</td>
+                          <td>
+                            {formatMs(
+                              event.durationMs
+                            )}
+                          </td>
 
-                        <td>{event.touchSeen ? 'Yes' : 'No'}</td>
+                          <td>
+                            {event.touchSeen
+                              ? 'Yes'
+                              : 'No'}
+                          </td>
 
-                        <td>
-                          {formatNumber(event.maxTiltAngle, 1)}°
-                        </td>
+                          <td>
+                            {formatNumber(
+                              event.maxTiltAngle,
+                              1
+                            )}
+                            °
+                          </td>
 
-                        <td>
-                          {formatNumber(event.averageTiltAngle, 1)}°
-                        </td>
+                          <td>
+                            {formatNumber(
+                              event.averageTiltAngle,
+                              1
+                            )}
+                            °
+                          </td>
 
-                        <td>
-                          {formatNumber(event.totalMotion, 3)}
-                        </td>
+                          <td>
+                            {formatNumber(
+                              event.totalMotion,
+                              3
+                            )}
+                          </td>
 
-                        <td>
-                          {formatNumber(event.averageMotion, 3)}
-                        </td>
+                          <td>
+                            {formatNumber(
+                              event.averageMotion,
+                              3
+                            )}
+                          </td>
 
-                        <td>
-                          {formatNumber(event.peakMotion, 3)}
-                        </td>
+                          <td>
+                            {formatNumber(
+                              event.peakMotion,
+                              3
+                            )}
+                          </td>
 
-                        <td>
-                          {formatNumber(
-                            event.motionVariability,
-                            3
-                          )}
-                        </td>
+                          <td>
+                            {formatNumber(
+                              event.motionVariability,
+                              3
+                            )}
+                          </td>
 
-                        <td>{event.sampleCount}</td>
-                      </tr>
-                    ))}
+                          <td>
+                            {event.sampleCount}
+                          </td>
+                        </tr>
+                      )
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -1558,26 +2824,29 @@ function App() {
           <section className="section-block">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Major change timeline</p>
-                <h2>Appointment Memory</h2>
+                <p className="eyebrow">
+                  Major change timeline
+                </p>
+
+                <h2>
+                  Appointment Memory
+                </h2>
               </div>
             </div>
 
             <div className="empty-card">
-              Repeated-change detection will be added in a later step.
+              Repeated-change detection will be added next.
             </div>
           </section>
         </main>
       )}
 
-      {/* =====================================================
-          ENGINEERING DASHBOARD
-          ===================================================== */}
-
       {session === 'engineering' && (
         <main className="dashboard-view">
           <section className="engineering-header">
-            <p className="eyebrow">Engineering</p>
+            <p className="eyebrow">
+              Engineering
+            </p>
 
             <h2 className="caregiver-title">
               Device & detection diagnostics
@@ -1591,10 +2860,14 @@ function App() {
 
           <section className="engineering-top-grid">
             <div className="engineering-feature">
-              <p className="card-label">Device</p>
+              <p className="card-label">
+                Device
+              </p>
 
               <h2>
-                {connected ? 'Arduino online' : 'Waiting for Arduino'}
+                {connected
+                  ? 'Arduino online'
+                  : 'Waiting for Arduino'}
               </h2>
 
               <button
@@ -1611,7 +2884,9 @@ function App() {
             </div>
 
             <div className="engineering-feature">
-              <p className="card-label">Touch sensor</p>
+              <p className="card-label">
+                Touch sensor
+              </p>
 
               <h2
                 key={sensorData.touch}
@@ -1632,7 +2907,9 @@ function App() {
             </div>
 
             <div className="engineering-feature">
-              <p className="card-label">Movement state</p>
+              <p className="card-label">
+                Movement state
+              </p>
 
               <h2
                 key={movementState}
@@ -1653,22 +2930,47 @@ function App() {
           <section className="section-block">
             <div className="debug-grid">
               <div className="engineering-feature">
-                <h3>Live serial</h3>
+                <h3>
+                  Live serial
+                </h3>
 
-                <p className="mono">{lastLine}</p>
+                <p className="mono">
+                  {lastLine}
+                </p>
 
-                <p>Time: {sensorData.t_ms} ms</p>
-                <p>X: {sensorData.ax}</p>
-                <p>Y: {sensorData.ay}</p>
-                <p>Z: {sensorData.az}</p>
+                <p>
+                  Time: {sensorData.t_ms} ms
+                </p>
+
+                <p>
+                  X: {sensorData.ax}
+                </p>
+
+                <p>
+                  Y: {sensorData.ay}
+                </p>
+
+                <p>
+                  Z: {sensorData.az}
+                </p>
               </div>
 
               <div className="engineering-feature">
-                <h3>Rest calibration</h3>
+                <h3>
+                  Rest calibration
+                </h3>
 
-                <p>Rest X: {restBaseline.ax.toFixed(3)}</p>
-                <p>Rest Y: {restBaseline.ay.toFixed(3)}</p>
-                <p>Rest Z: {restBaseline.az.toFixed(3)}</p>
+                <p>
+                  Rest X: {restBaseline.ax.toFixed(3)}
+                </p>
+
+                <p>
+                  Rest Y: {restBaseline.ay.toFixed(3)}
+                </p>
+
+                <p>
+                  Rest Z: {restBaseline.az.toFixed(3)}
+                </p>
 
                 <button
                   className="secondary-button"
@@ -1680,19 +2982,29 @@ function App() {
               </div>
 
               <div className="engineering-feature">
-                <h3>Detection checks</h3>
+                <h3>
+                  Detection checks
+                </h3>
 
                 <p>
                   Tilt angle: {debug.tiltAngleDegrees.toFixed(1)}°
                 </p>
 
-                <p>Motion: {debug.motionAmount.toFixed(3)}</p>
+                <p>
+                  Motion: {debug.motionAmount.toFixed(3)}
+                </p>
 
-                <p>Tilted: {debug.isTilted ? 'Yes' : 'No'}</p>
+                <p>
+                  Tilted: {debug.isTilted ? 'Yes' : 'No'}
+                </p>
 
-                <p>Moving: {debug.isMoving ? 'Yes' : 'No'}</p>
+                <p>
+                  Moving: {debug.isMoving ? 'Yes' : 'No'}
+                </p>
 
-                <p>At rest: {debug.isAtRest ? 'Yes' : 'No'}</p>
+                <p>
+                  At rest: {debug.isAtRest ? 'Yes' : 'No'}
+                </p>
 
                 <p>
                   Cooldown: {debug.cooldownActive ? 'Active' : 'No'}
@@ -1704,9 +3016,13 @@ function App() {
           <section className="section-block">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Detector</p>
+                <p className="eyebrow">
+                  Detector
+                </p>
 
-                <h2>Rejected interactions</h2>
+                <h2>
+                  Rejected interactions
+                </h2>
               </div>
             </div>
 
@@ -1729,24 +3045,45 @@ function App() {
                   </thead>
 
                   <tbody>
-                    {rejectionLog.map((rejection) => (
-                      <tr key={rejection.id}>
-                        <td>{rejection.id}</td>
-                        <td>{rejection.reason}</td>
+                    {rejectionLog.map(
+                      (rejection) => (
+                        <tr
+                          key={rejection.id}
+                        >
+                          <td>
+                            {rejection.id}
+                          </td>
 
-                        <td>{formatMs(rejection.durationMs)}</td>
+                          <td>
+                            {rejection.reason}
+                          </td>
 
-                        <td>
-                          {rejection.touchSeen ? 'Yes' : 'No'}
-                        </td>
+                          <td>
+                            {formatMs(
+                              rejection.durationMs
+                            )}
+                          </td>
 
-                        <td>
-                          {formatNumber(rejection.maxTiltAngle, 1)}°
-                        </td>
+                          <td>
+                            {rejection.touchSeen
+                              ? 'Yes'
+                              : 'No'}
+                          </td>
 
-                        <td>{rejection.clockTime}</td>
-                      </tr>
-                    ))}
+                          <td>
+                            {formatNumber(
+                              rejection.maxTiltAngle,
+                              1
+                            )}
+                            °
+                          </td>
+
+                          <td>
+                            {rejection.clockTime}
+                          </td>
+                        </tr>
+                      )
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -1764,8 +3101,13 @@ function App() {
           <section className="section-block">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">State machine</p>
-                <h2>State history</h2>
+                <p className="eyebrow">
+                  State machine
+                </p>
+
+                <h2>
+                  State history
+                </h2>
               </div>
             </div>
 
@@ -1784,12 +3126,19 @@ function App() {
                   </thead>
 
                   <tbody>
-                    {stateHistory.map((entry, index) => (
-                      <tr key={index}>
-                        <td>{entry.state}</td>
-                        <td>{entry.time} ms</td>
-                      </tr>
-                    ))}
+                    {stateHistory.map(
+                      (entry, index) => (
+                        <tr key={index}>
+                          <td>
+                            {entry.state}
+                          </td>
+
+                          <td>
+                            {entry.time} ms
+                          </td>
+                        </tr>
+                      )
+                    )}
                   </tbody>
                 </table>
               </div>
