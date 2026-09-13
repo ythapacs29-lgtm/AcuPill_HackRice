@@ -171,7 +171,7 @@ p {
 }
 
 .login-message h2 {
-  max-width: 12ch;
+  width: min(100%, 17ch);
 
   margin: 0;
 
@@ -179,14 +179,20 @@ p {
 
   font-size: clamp(3rem, 6vw, 5.3rem);
   font-weight: 500;
+  line-height: 1.02;
+  letter-spacing: -0.045em;
 
-  line-height: 0.98;
-
-  letter-spacing: -0.06em;
+  min-height: 2.4em;
 }
 
 .rotating-login-word {
   display: inline-block;
+
+  width: 13ch;
+  min-width: 13ch;
+  white-space: nowrap;
+  text-align: left;
+  vertical-align: baseline;
 
   color: var(--green);
 

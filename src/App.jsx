@@ -1,5 +1,14 @@
+import CaregiverMockPreview from './CaregiverMockPreview.jsx'
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
+import {
+  flushInteractionEventQueue,
+  queueInteractionEvent,
+} from './services/acupillApi.js'
+
+/* ============================================================
+   ACUPILL DETECTION SETTINGS
+   ============================================================ */
 
 const TILT_THRESHOLD_DEGREES = 30
 const RETURN_THRESHOLD_DEGREES = 25
@@ -10,8 +19,57 @@ const MIN_EVENT_DURATION_MS = 1000
 const MAX_EVENT_DURATION_MS = 15000
 const EVENT_COOLDOWN_MS = 4000
 
-const EVENT_STORAGE_KEY = 'acupill_event_history_v1'
-const SCHEDULE_STORAGE_KEY = 'acupill_schedule_v1'
+/* ============================================================
+   MAJOR CHANGE SETTINGS
+
+   An individual interaction is "outside baseline" if ANY of:
+
+   duration difference > 35%
+   total motion difference > 30%
+   movement variability difference > 25%
+
+   We DO NOT surface one unusual interaction.
+
+   3 of last 5 comparable valid interactions
+   = create Major Change marker
+   ============================================================ */
+
+const DURATION_DEVIATION_THRESHOLD = 35
+const MOTION_DEVIATION_THRESHOLD = 30
+const VARIABILITY_DEVIATION_THRESHOLD = 25
+
+const MIN_BASELINE_EVENTS = 4
+const MAJOR_CHANGE_WINDOW_SIZE = 5
+const MAJOR_CHANGE_REQUIRED_COUNT = 3
+
+/* ============================================================
+   STORAGE
+   ============================================================ */
+
+const EVENT_STORAGE_KEY =
+  'acupill_event_history_v1'
+
+const SCHEDULE_STORAGE_KEY =
+  'acupill_schedule_v1'
+
+const MAJOR_CHANGE_STORAGE_KEY =
+  'acupill_major_changes_v1'
+
+const CHECKIN_STORAGE_KEY =
+  'acupill_checkins_v1'
+
+const API_PATIENT_ID =
+  '5e22c7c9-b8d8-4076-814f-87f59d42ce4a'
+
+const API_DEVICE_ID =
+  '70064ad6-90ac-430a-94e5-84e0ddeb2c4d'
+
+const DETECTOR_VERSION =
+  'm10-v1'
+
+/* ============================================================
+   SCHEDULE MATCHING
+   ============================================================ */
 
 const EARLY_WINDOW_MINUTES = 30
 const RECORDED_WINDOW_MINUTES = 60
@@ -39,10 +97,16 @@ const ROTATING_TERMS = [
   'independence',
 ]
 
+/* ============================================================
+   SENSOR PARSER
+   ============================================================ */
+
 function parseSensorLine(line) {
   const parts = line.trim().split(',')
 
-  if (parts.length !== 5) return null
+  if (parts.length !== 5) {
+    return null
+  }
 
   const data = {
     t_ms: Number(parts[0]),
@@ -65,6 +129,10 @@ function parseSensorLine(line) {
   return data
 }
 
+/* ============================================================
+   MATH
+   ============================================================ */
+
 function vectorMagnitude(vector) {
   return Math.sqrt(
     vector.ax * vector.ax +
@@ -74,22 +142,35 @@ function vectorMagnitude(vector) {
 }
 
 function angleBetweenVectorsDegrees(a, b) {
-  const dot = a.ax * b.ax + a.ay * b.ay + a.az * b.az
+  const dot =
+    a.ax * b.ax +
+    a.ay * b.ay +
+    a.az * b.az
 
   const magA = vectorMagnitude(a)
   const magB = vectorMagnitude(b)
 
-  if (magA === 0 || magB === 0) return 0
+  if (magA === 0 || magB === 0) {
+    return 0
+  }
 
   let cosine = dot / (magA * magB)
 
-  cosine = Math.max(-1, Math.min(1, cosine))
+  cosine = Math.max(
+    -1,
+    Math.min(1, cosine)
+  )
 
-  return Math.acos(cosine) * (180 / Math.PI)
+  return (
+    Math.acos(cosine) *
+    (180 / Math.PI)
+  )
 }
 
 function averageSamples(samples) {
-  if (samples.length === 0) return null
+  if (samples.length === 0) {
+    return null
+  }
 
   const total = samples.reduce(
     (sum, sample) => ({
@@ -112,233 +193,722 @@ function averageSamples(samples) {
 }
 
 function average(numbers) {
-  if (numbers.length === 0) return 0
+  if (numbers.length === 0) {
+    return 0
+  }
 
-  return numbers.reduce((total, value) => total + value, 0) / numbers.length
+  return (
+    numbers.reduce(
+      (total, value) =>
+        total + value,
+      0
+    ) / numbers.length
+  )
 }
 
 function sum(numbers) {
-  return numbers.reduce((total, value) => total + value, 0)
+  return numbers.reduce(
+    (total, value) =>
+      total + value,
+    0
+  )
 }
 
 function standardDeviation(numbers) {
-  if (numbers.length === 0) return 0
+  if (numbers.length === 0) {
+    return 0
+  }
 
   const avg = average(numbers)
 
   const variance =
-    numbers.reduce((total, value) => {
-      const difference = value - avg
+    numbers.reduce(
+      (total, value) => {
+        const difference =
+          value - avg
 
-      return total + difference * difference
-    }, 0) / numbers.length
+        return (
+          total +
+          difference * difference
+        )
+      },
+      0
+    ) / numbers.length
 
   return Math.sqrt(variance)
 }
 
-function loadSavedEvents() {
+function percentChange(
+  latestValue,
+  baselineValue
+) {
+  if (
+    !Number.isFinite(latestValue) ||
+    !Number.isFinite(baselineValue) ||
+    baselineValue === 0
+  ) {
+    return 0
+  }
+
+  return (
+    ((latestValue -
+      baselineValue) /
+      baselineValue) *
+    100
+  )
+}
+
+/* ============================================================
+   STORAGE HELPERS
+   ============================================================ */
+
+function loadArrayFromStorage(
+  key,
+  fallback = []
+) {
   try {
-    const saved = localStorage.getItem(EVENT_STORAGE_KEY)
+    const saved =
+      localStorage.getItem(key)
 
-    if (!saved) return []
+    if (!saved) {
+      return fallback
+    }
 
-    const parsed = JSON.parse(saved)
+    const parsed =
+      JSON.parse(saved)
 
-    return Array.isArray(parsed) ? parsed : []
+    return Array.isArray(parsed)
+      ? parsed
+      : fallback
   } catch (error) {
-    console.error('Could not load saved events:', error)
+    console.error(
+      `Could not load ${key}:`,
+      error
+    )
 
-    return []
+    return fallback
   }
 }
 
-function saveEvents(events) {
+function saveArrayToStorage(
+  key,
+  value
+) {
   try {
     localStorage.setItem(
-      EVENT_STORAGE_KEY,
-      JSON.stringify(events)
+      key,
+      JSON.stringify(value)
     )
   } catch (error) {
-    console.error('Could not save events:', error)
+    console.error(
+      `Could not save ${key}:`,
+      error
+    )
   }
+}
+
+function loadSavedEvents() {
+  return loadArrayFromStorage(
+    EVENT_STORAGE_KEY,
+    []
+  )
+}
+
+function loadMajorChanges() {
+  return loadArrayFromStorage(
+    MAJOR_CHANGE_STORAGE_KEY,
+    []
+  )
+}
+
+function loadCheckIns() {
+  return loadArrayFromStorage(
+    CHECKIN_STORAGE_KEY,
+    []
+  )
 }
 
 function loadSchedule() {
-  try {
-    const saved = localStorage.getItem(SCHEDULE_STORAGE_KEY)
+  const loaded =
+    loadArrayFromStorage(
+      SCHEDULE_STORAGE_KEY,
+      DEFAULT_SCHEDULE
+    )
 
-    if (!saved) return DEFAULT_SCHEDULE
-
-    const parsed = JSON.parse(saved)
-
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      return DEFAULT_SCHEDULE
-    }
-
-    return parsed
-  } catch (error) {
-    console.error('Could not load schedule:', error)
-
+  if (loaded.length === 0) {
     return DEFAULT_SCHEDULE
   }
+
+  return loaded
 }
 
-function saveSchedule(schedule) {
-  try {
-    localStorage.setItem(
-      SCHEDULE_STORAGE_KEY,
-      JSON.stringify(schedule)
-    )
-  } catch (error) {
-    console.error('Could not save schedule:', error)
-  }
-}
-
-function calculateBaseline(events) {
-  if (events.length === 0) return null
-
-  return {
-    count: events.length,
-
-    durationMs: average(
-      events.map((event) => event.durationMs || 0)
-    ),
-
-    maxTiltAngle: average(
-      events.map((event) => event.maxTiltAngle || 0)
-    ),
-
-    totalMotion: average(
-      events.map((event) => event.totalMotion || 0)
-    ),
-
-    averageMotion: average(
-      events.map((event) => event.averageMotion || 0)
-    ),
-
-    peakMotion: average(
-      events.map((event) => event.peakMotion || 0)
-    ),
-
-    motionVariability: average(
-      events.map((event) => event.motionVariability || 0)
-    ),
-  }
-}
-
-function percentChange(latestValue, baselineValue) {
-  if (baselineValue === 0) return 0
-
-  return ((latestValue - baselineValue) / baselineValue) * 100
-}
+/* ============================================================
+   FORMATTING
+   ============================================================ */
 
 function formatPercent(value) {
-  const sign = value > 0 ? '+' : ''
+  if (!Number.isFinite(value)) {
+    return '—'
+  }
+
+  const sign =
+    value > 0 ? '+' : ''
 
   return `${sign}${value.toFixed(1)}%`
 }
 
-function formatNumber(value, digits = 3) {
-  if (!Number.isFinite(value)) return '—'
+function formatNumber(
+  value,
+  digits = 3
+) {
+  if (!Number.isFinite(value)) {
+    return '—'
+  }
 
   return value.toFixed(digits)
 }
 
 function formatMs(value) {
-  if (!Number.isFinite(value)) return '—'
+  if (!Number.isFinite(value)) {
+    return '—'
+  }
 
-  return `${value} ms`
+  return `${Math.round(value)} ms`
 }
 
 function formatScheduleTime(time) {
-  if (!time) return '—'
+  if (!time) {
+    return '—'
+  }
 
-  const [hoursString, minutesString] = time.split(':')
+  const [
+    hoursString,
+    minutesString,
+  ] = time.split(':')
 
-  let hours = Number(hoursString)
-  const minutes = Number(minutesString)
+  let hours =
+    Number(hoursString)
 
-  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) {
+  const minutes =
+    Number(minutesString)
+
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes)
+  ) {
     return time
   }
 
-  const period = hours >= 12 ? 'PM' : 'AM'
+  const period =
+    hours >= 12
+      ? 'PM'
+      : 'AM'
 
   hours %= 12
 
-  if (hours === 0) hours = 12
+  if (hours === 0) {
+    hours = 12
+  }
 
-  return `${hours}:${String(minutes).padStart(2, '0')} ${period}`
+  return `${hours}:${String(
+    minutes
+  ).padStart(2, '0')} ${period}`
 }
 
-function getScheduleDate(baseDate, time) {
-  const [hours, minutes] = time.split(':').map(Number)
+function formatLongDate(date) {
+  return date.toLocaleDateString(
+    undefined,
+    {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    }
+  )
+}
 
-  const date = new Date(baseDate)
+function formatDayName(date) {
+  return date.toLocaleDateString(
+    undefined,
+    {
+      weekday: 'short',
+    }
+  )
+}
 
-  date.setHours(hours, minutes, 0, 0)
+function formatShortDate(date) {
+  return date.toLocaleDateString(
+    undefined,
+    {
+      month: 'short',
+      day: 'numeric',
+    }
+  )
+}
+
+/* ============================================================
+   DATES
+   ============================================================ */
+
+function getScheduleDate(
+  baseDate,
+  time
+) {
+  const [hours, minutes] =
+    time
+      .split(':')
+      .map(Number)
+
+  const date =
+    new Date(baseDate)
+
+  date.setHours(
+    hours,
+    minutes,
+    0,
+    0
+  )
 
   return date
 }
 
 function startOfDay(date) {
-  const result = new Date(date)
+  const result =
+    new Date(date)
 
-  result.setHours(0, 0, 0, 0)
+  result.setHours(
+    0,
+    0,
+    0,
+    0
+  )
 
   return result
 }
 
-function addDays(date, numberOfDays) {
-  const result = new Date(date)
+function addDays(
+  date,
+  numberOfDays
+) {
+  const result =
+    new Date(date)
 
-  result.setDate(result.getDate() + numberOfDays)
+  result.setDate(
+    result.getDate() +
+      numberOfDays
+  )
 
   return result
 }
 
 function isSameDay(a, b) {
   return (
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate()
+    a.getFullYear() ===
+      b.getFullYear() &&
+    a.getMonth() ===
+      b.getMonth() &&
+    a.getDate() ===
+      b.getDate()
   )
 }
 
-function formatDayName(date) {
-  return date.toLocaleDateString(undefined, {
-    weekday: 'short',
-  })
-}
-
-function formatShortDate(date) {
-  return date.toLocaleDateString(undefined, {
-    month: 'short',
-    day: 'numeric',
-  })
-}
-
 function getEventDate(event) {
-  if (!event.recordedAtISO) return null
+  if (!event.recordedAtISO) {
+    return null
+  }
 
-  const date = new Date(event.recordedAtISO)
+  const date =
+    new Date(
+      event.recordedAtISO
+    )
 
-  if (Number.isNaN(date.getTime())) return null
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return null
+  }
 
   return date
 }
 
-function getNextMedication(schedule, now) {
-  const enabledSchedule = schedule
-    .filter((item) => item.enabled)
-    .sort((a, b) => a.time.localeCompare(b.time))
+function createApiEventId() {
+  return crypto.randomUUID()
+}
 
-  if (enabledSchedule.length === 0) return null
+/* ============================================================
+   BASELINE
+   ============================================================ */
 
-  for (const item of enabledSchedule) {
-    const scheduledDate = getScheduleDate(now, item.time)
+function calculateBaseline(events) {
+  if (
+    !events ||
+    events.length === 0
+  ) {
+    return null
+  }
 
-    if (scheduledDate > now) {
+  return {
+    count: events.length,
+
+    durationMs: average(
+      events.map(
+        (event) =>
+          event.durationMs || 0
+      )
+    ),
+
+    maxTiltAngle: average(
+      events.map(
+        (event) =>
+          event.maxTiltAngle || 0
+      )
+    ),
+
+    totalMotion: average(
+      events.map(
+        (event) =>
+          event.totalMotion || 0
+      )
+    ),
+
+    averageMotion: average(
+      events.map(
+        (event) =>
+          event.averageMotion || 0
+      )
+    ),
+
+    peakMotion: average(
+      events.map(
+        (event) =>
+          event.peakMotion || 0
+      )
+    ),
+
+    motionVariability: average(
+      events.map(
+        (event) =>
+          event.motionVariability || 0
+      )
+    ),
+  }
+}
+
+/* ============================================================
+   EVENT BASELINE COMPARISON
+
+   IMPORTANT:
+   This receives PRIOR events only.
+   The new event does not participate in
+   the baseline used to evaluate itself.
+   ============================================================ */
+
+function calculateEventBaselineComparison(
+  telemetry,
+  priorEvents
+) {
+  const baseline =
+    calculateBaseline(
+      priorEvents
+    )
+
+  if (
+    !baseline ||
+    baseline.count <
+      MIN_BASELINE_EVENTS
+  ) {
+    return {
+      hasBaseline: false,
+
+      outsideBaseline: false,
+
+      durationPct: null,
+      totalMotionPct: null,
+      variabilityPct: null,
+
+      durationOutside: false,
+      motionOutside: false,
+      variabilityOutside: false,
+
+      baselineEventCount:
+        baseline?.count || 0,
+    }
+  }
+
+  const durationPct =
+    percentChange(
+      telemetry.durationMs,
+      baseline.durationMs
+    )
+
+  const totalMotionPct =
+    percentChange(
+      telemetry.totalMotion,
+      baseline.totalMotion
+    )
+
+  const variabilityPct =
+    percentChange(
+      telemetry.motionVariability,
+      baseline.motionVariability
+    )
+
+  const durationOutside =
+    Math.abs(durationPct) >
+    DURATION_DEVIATION_THRESHOLD
+
+  const motionOutside =
+    Math.abs(totalMotionPct) >
+    MOTION_DEVIATION_THRESHOLD
+
+  const variabilityOutside =
+    Math.abs(variabilityPct) >
+    VARIABILITY_DEVIATION_THRESHOLD
+
+  return {
+    hasBaseline: true,
+
+    outsideBaseline:
+      durationOutside ||
+      motionOutside ||
+      variabilityOutside,
+
+    durationPct,
+    totalMotionPct,
+    variabilityPct,
+
+    durationOutside,
+    motionOutside,
+    variabilityOutside,
+
+    baselineEventCount:
+      baseline.count,
+
+    baselineSnapshot: {
+      durationMs:
+        baseline.durationMs,
+
+      totalMotion:
+        baseline.totalMotion,
+
+      motionVariability:
+        baseline.motionVariability,
+
+      maxTiltAngle:
+        baseline.maxTiltAngle,
+
+      averageMotion:
+        baseline.averageMotion,
+
+      peakMotion:
+        baseline.peakMotion,
+    },
+  }
+}
+
+/* ============================================================
+   3 OF LAST 5 PERSISTENCE LOGIC
+   ============================================================ */
+
+function getRecentDeviationSummary(
+  events
+) {
+  const comparableEvents =
+    events
+      .filter(
+        (event) =>
+          event
+            .baselineComparison
+            ?.hasBaseline
+      )
+      .slice(
+        0,
+        MAJOR_CHANGE_WINDOW_SIZE
+      )
+
+  const unusualEvents =
+    comparableEvents.filter(
+      (event) =>
+        event
+          .baselineComparison
+          ?.outsideBaseline
+    )
+
+  const durationCount =
+    comparableEvents.filter(
+      (event) =>
+        event
+          .baselineComparison
+          ?.durationOutside
+    ).length
+
+  const motionCount =
+    comparableEvents.filter(
+      (event) =>
+        event
+          .baselineComparison
+          ?.motionOutside
+    ).length
+
+  const variabilityCount =
+    comparableEvents.filter(
+      (event) =>
+        event
+          .baselineComparison
+          ?.variabilityOutside
+    ).length
+
+  return {
+    comparableCount:
+      comparableEvents.length,
+
+    unusualCount:
+      unusualEvents.length,
+
+    durationCount,
+    motionCount,
+    variabilityCount,
+
+    comparableEvents,
+    unusualEvents,
+
+    qualifies:
+      comparableEvents.length ===
+        MAJOR_CHANGE_WINDOW_SIZE &&
+      unusualEvents.length >=
+        MAJOR_CHANGE_REQUIRED_COUNT,
+  }
+}
+
+function createMajorChangeMarker(
+  summary,
+  triggerEvent
+) {
+  const unusualComparisons =
+    summary.unusualEvents.map(
+      (event) =>
+        event.baselineComparison
+    )
+
+  return {
+    id:
+      `major-${triggerEvent.id}-${Date.now()}`,
+
+    createdAtISO:
+      triggerEvent.recordedAtISO,
+
+    recordedDate:
+      triggerEvent.recordedDate,
+
+    clockTime:
+      triggerEvent.clockTime,
+
+    triggerEventId:
+      triggerEvent.id,
+
+    unusualCount:
+      summary.unusualCount,
+
+    windowSize:
+      MAJOR_CHANGE_WINDOW_SIZE,
+
+    eventIds:
+      summary.comparableEvents.map(
+        (event) => event.id
+      ),
+
+    unusualEventIds:
+      summary.unusualEvents.map(
+        (event) => event.id
+      ),
+
+    durationCount:
+      summary.durationCount,
+
+    motionCount:
+      summary.motionCount,
+
+    variabilityCount:
+      summary.variabilityCount,
+
+    averageDurationPct:
+      average(
+        unusualComparisons
+          .map(
+            (comparison) =>
+              comparison.durationPct
+          )
+          .filter(
+            Number.isFinite
+          )
+      ),
+
+    averageTotalMotionPct:
+      average(
+        unusualComparisons
+          .map(
+            (comparison) =>
+              comparison.totalMotionPct
+          )
+          .filter(
+            Number.isFinite
+          )
+      ),
+
+    averageVariabilityPct:
+      average(
+        unusualComparisons
+          .map(
+            (comparison) =>
+              comparison.variabilityPct
+          )
+          .filter(
+            Number.isFinite
+          )
+      ),
+  }
+}
+
+/* ============================================================
+   SCHEDULE
+   ============================================================ */
+
+function getNextMedication(
+  schedule,
+  now
+) {
+  const enabledSchedule =
+    schedule
+      .filter(
+        (item) => item.enabled
+      )
+      .sort(
+        (a, b) =>
+          a.time.localeCompare(
+            b.time
+          )
+      )
+
+  if (
+    enabledSchedule.length === 0
+  ) {
+    return null
+  }
+
+  for (
+    const item of
+    enabledSchedule
+  ) {
+    const scheduledDate =
+      getScheduleDate(
+        now,
+        item.time
+      )
+
+    if (
+      scheduledDate > now
+    ) {
       return {
         ...item,
         scheduledDate,
@@ -347,17 +917,20 @@ function getNextMedication(schedule, now) {
     }
   }
 
-  const firstTomorrow = enabledSchedule[0]
+  const firstTomorrow =
+    enabledSchedule[0]
 
-  const tomorrow = addDays(now, 1)
+  const tomorrow =
+    addDays(now, 1)
 
   return {
     ...firstTomorrow,
 
-    scheduledDate: getScheduleDate(
-      tomorrow,
-      firstTomorrow.time
-    ),
+    scheduledDate:
+      getScheduleDate(
+        tomorrow,
+        firstTomorrow.time
+      ),
 
     isTomorrow: true,
   }
@@ -369,197 +942,454 @@ function buildScheduleStatusesForDate(
   dayDate,
   now
 ) {
-  const activeSchedule = schedule
-    .filter((item) => item.enabled)
-    .sort((a, b) => a.time.localeCompare(b.time))
+  const activeSchedule =
+    schedule
+      .filter(
+        (item) => item.enabled
+      )
+      .sort(
+        (a, b) =>
+          a.time.localeCompare(
+            b.time
+          )
+      )
 
-  const usableEvents = events
-    .map((event) => ({
-      event,
-      date: getEventDate(event),
-    }))
-    .filter((entry) => entry.date)
+  const usableEvents =
+    events
+      .map((event) => ({
+        event,
+        date:
+          getEventDate(event),
+      }))
+      .filter(
+        (entry) =>
+          entry.date
+      )
 
-  const usedEventIds = new Set()
+  const usedEventIds =
+    new Set()
 
-  const todayStart = startOfDay(now)
-  const requestedDayStart = startOfDay(dayDate)
+  const todayStart =
+    startOfDay(now)
+
+  const requestedDayStart =
+    startOfDay(dayDate)
 
   const requestedDayIsPast =
-    requestedDayStart.getTime() < todayStart.getTime()
+    requestedDayStart.getTime() <
+    todayStart.getTime()
 
   const requestedDayIsFuture =
-    requestedDayStart.getTime() > todayStart.getTime()
+    requestedDayStart.getTime() >
+    todayStart.getTime()
 
-  return activeSchedule.map((item) => {
-    const scheduledDate = getScheduleDate(
-      dayDate,
-      item.time
-    )
-
-    const earlyStart = new Date(
-      scheduledDate.getTime() -
-        EARLY_WINDOW_MINUTES * 60 * 1000
-    )
-
-    const recordedEnd = new Date(
-      scheduledDate.getTime() +
-        RECORDED_WINDOW_MINUTES * 60 * 1000
-    )
-
-    const lateEnd = new Date(
-      scheduledDate.getTime() +
-        LATE_WINDOW_MINUTES * 60 * 1000
-    )
-
-    const matchingEvents = usableEvents
-      .filter(({ event, date }) => {
-        return (
-          !usedEventIds.has(event.id) &&
-          date >= earlyStart &&
-          date <= lateEnd
-        )
-      })
-      .sort((a, b) => {
-        const aDifference = Math.abs(
-          a.date.getTime() - scheduledDate.getTime()
+  return activeSchedule.map(
+    (item) => {
+      const scheduledDate =
+        getScheduleDate(
+          dayDate,
+          item.time
         )
 
-        const bDifference = Math.abs(
-          b.date.getTime() - scheduledDate.getTime()
+      const earlyStart =
+        new Date(
+          scheduledDate.getTime() -
+            EARLY_WINDOW_MINUTES *
+              60 *
+              1000
         )
 
-        return aDifference - bDifference
-      })
+      const recordedEnd =
+        new Date(
+          scheduledDate.getTime() +
+            RECORDED_WINDOW_MINUTES *
+              60 *
+              1000
+        )
 
-    const matched = matchingEvents[0]
+      const lateEnd =
+        new Date(
+          scheduledDate.getTime() +
+            LATE_WINDOW_MINUTES *
+              60 *
+              1000
+        )
 
-    if (matched) {
-      usedEventIds.add(matched.event.id)
+      const matchingEvents =
+        usableEvents
+          .filter(
+            ({
+              event,
+              date,
+            }) =>
+              !usedEventIds.has(
+                event.id
+              ) &&
+              date >= earlyStart &&
+              date <= lateEnd
+          )
+          .sort(
+            (a, b) =>
+              Math.abs(
+                a.date.getTime() -
+                  scheduledDate.getTime()
+              ) -
+              Math.abs(
+                b.date.getTime() -
+                  scheduledDate.getTime()
+              )
+          )
 
-      if (matched.date <= recordedEnd) {
+      const matched =
+        matchingEvents[0]
+
+      if (matched) {
+        usedEventIds.add(
+          matched.event.id
+        )
+
+        if (
+          matched.date <=
+          recordedEnd
+        ) {
+          return {
+            ...item,
+
+            scheduledDate,
+
+            status:
+              'recorded',
+
+            statusLabel:
+              'Recorded',
+
+            matchedEvent:
+              matched.event,
+
+            matchedDate:
+              matched.date,
+          }
+        }
+
         return {
           ...item,
+
           scheduledDate,
-          status: 'recorded',
-          statusLabel: 'Recorded',
-          matchedEvent: matched.event,
-          matchedDate: matched.date,
+
+          status:
+            'late',
+
+          statusLabel:
+            'Recorded late',
+
+          matchedEvent:
+            matched.event,
+
+          matchedDate:
+            matched.date,
+        }
+      }
+
+      if (
+        requestedDayIsFuture
+      ) {
+        return {
+          ...item,
+
+          scheduledDate,
+
+          status:
+            'upcoming',
+
+          statusLabel:
+            'Upcoming',
+
+          matchedEvent: null,
+        }
+      }
+
+      if (
+        requestedDayIsPast
+      ) {
+        return {
+          ...item,
+
+          scheduledDate,
+
+          status:
+            'missing',
+
+          statusLabel:
+            'No interaction recorded',
+
+          matchedEvent: null,
+        }
+      }
+
+      if (
+        now < scheduledDate
+      ) {
+        return {
+          ...item,
+
+          scheduledDate,
+
+          status:
+            'upcoming',
+
+          statusLabel:
+            'Upcoming',
+
+          matchedEvent: null,
+        }
+      }
+
+      if (
+        now <= lateEnd
+      ) {
+        return {
+          ...item,
+
+          scheduledDate,
+
+          status:
+            'waiting',
+
+          statusLabel:
+            'No interaction recorded yet',
+
+          matchedEvent: null,
         }
       }
 
       return {
         ...item,
-        scheduledDate,
-        status: 'late',
-        statusLabel: 'Recorded late',
-        matchedEvent: matched.event,
-        matchedDate: matched.date,
-      }
-    }
 
-    if (requestedDayIsFuture) {
-      return {
-        ...item,
         scheduledDate,
-        status: 'upcoming',
-        statusLabel: 'Upcoming',
+
+        status:
+          'missing',
+
+        statusLabel:
+          'No interaction recorded',
+
         matchedEvent: null,
       }
     }
-
-    if (requestedDayIsPast) {
-      return {
-        ...item,
-        scheduledDate,
-        status: 'missing',
-        statusLabel: 'No interaction recorded',
-        matchedEvent: null,
-      }
-    }
-
-    if (now < scheduledDate) {
-      return {
-        ...item,
-        scheduledDate,
-        status: 'upcoming',
-        statusLabel: 'Upcoming',
-        matchedEvent: null,
-      }
-    }
-
-    if (now <= lateEnd) {
-      return {
-        ...item,
-        scheduledDate,
-        status: 'waiting',
-        statusLabel: 'No interaction recorded yet',
-        matchedEvent: null,
-      }
-    }
-
-    return {
-      ...item,
-      scheduledDate,
-      status: 'missing',
-      statusLabel: 'No interaction recorded',
-      matchedEvent: null,
-    }
-  })
+  )
 }
 
-function buildWeeklyRoutine(schedule, events, now) {
+function buildWeeklyRoutine(
+  schedule,
+  events,
+  now
+) {
   const days = []
 
-  for (let offset = 6; offset >= 0; offset -= 1) {
-    const date = addDays(startOfDay(now), -offset)
+  for (
+    let offset = 6;
+    offset >= 0;
+    offset -= 1
+  ) {
+    const date =
+      addDays(
+        startOfDay(now),
+        -offset
+      )
 
-    const statuses = buildScheduleStatusesForDate(
-      schedule,
-      events,
-      date,
-      now
-    )
+    const statuses =
+      buildScheduleStatusesForDate(
+        schedule,
+        events,
+        date,
+        now
+      )
 
-    const recorded = statuses.filter(
-      (item) => item.status === 'recorded'
-    ).length
+    const recorded =
+      statuses.filter(
+        (item) =>
+          item.status ===
+          'recorded'
+      ).length
 
-    const late = statuses.filter(
-      (item) => item.status === 'late'
-    ).length
+    const late =
+      statuses.filter(
+        (item) =>
+          item.status ===
+          'late'
+      ).length
 
-    const missing = statuses.filter(
-      (item) => item.status === 'missing'
-    ).length
+    const missing =
+      statuses.filter(
+        (item) =>
+          item.status ===
+          'missing'
+      ).length
 
-    const waiting = statuses.filter(
-      (item) =>
-        item.status === 'waiting' ||
-        item.status === 'upcoming'
-    ).length
-
-    const completed = recorded + late
+    const waiting =
+      statuses.filter(
+        (item) =>
+          item.status ===
+            'waiting' ||
+          item.status ===
+            'upcoming'
+      ).length
 
     days.push({
       date,
       statuses,
-      scheduled: statuses.length,
+
+      scheduled:
+        statuses.length,
+
       recorded,
       late,
       missing,
       waiting,
-      completed,
+
+      completed:
+        recorded + late,
     })
   }
 
   return days
 }
 
+/* ============================================================
+   TREND HELPERS
+   ============================================================ */
+
+function Sparkline({ values }) {
+  const usable =
+    values.filter(
+      Number.isFinite
+    )
+
+  if (usable.length < 2) {
+    return (
+      <p className="tiny-text">
+        More events needed.
+      </p>
+    )
+  }
+
+  const width = 260
+  const height = 70
+  const padding = 6
+
+  const min =
+    Math.min(...usable)
+
+  const max =
+    Math.max(...usable)
+
+  const range =
+    max - min || 1
+
+  const points =
+    usable
+      .map(
+        (value, index) => {
+          const x =
+            padding +
+            (index /
+              (usable.length - 1)) *
+              (width -
+                padding * 2)
+
+          const y =
+            height -
+            padding -
+            ((value - min) /
+              range) *
+              (height -
+                padding * 2)
+
+          return `${x},${y}`
+        }
+      )
+      .join(' ')
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      style={{
+        width: '100%',
+        maxWidth: '280px',
+        height: '70px',
+        display: 'block',
+        marginTop: '10px',
+        overflow: 'visible',
+      }}
+      aria-hidden="true"
+    >
+      <line
+        x1={padding}
+        y1={height - padding}
+        x2={width - padding}
+        y2={height - padding}
+        stroke="currentColor"
+        opacity="0.12"
+      />
+
+      <polyline
+        points={points}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+function TrendCard({
+  label,
+  values,
+  formatter,
+}) {
+  const latest =
+    values.length > 0
+      ? values[
+          values.length - 1
+        ]
+      : null
+
+  return (
+    <div className="metric-card">
+      <p className="metric-label">
+        {label}
+      </p>
+
+      <p className="metric-value">
+        {latest === null
+          ? '—'
+          : formatter(latest)}
+      </p>
+
+      <Sparkline
+        values={values}
+      />
+
+      <p className="metric-subtext">
+        Oldest → newest
+      </p>
+    </div>
+  )
+}
+
+/* ============================================================
+   LOGO
+   ============================================================ */
+
 function LogoMark() {
   return (
     <div className="logo-lockup">
-      <div className="logo-icon" aria-hidden="true">
+      <div
+        className="logo-icon"
+        aria-hidden="true"
+      >
         <svg
           viewBox="0 0 64 64"
           width="46"
@@ -596,12 +1426,16 @@ function LogoMark() {
 
       <div>
         <p className="eyebrow">
-          Medication support between appointments
+          Medication support
+          between appointments
         </p>
 
         <h1 className="brand-title">
           <span>Acu</span>
-          <span className="brand-accent">Pill</span>
+
+          <span className="brand-accent">
+            Pill
+          </span>
         </h1>
       </div>
     </div>
@@ -635,41 +1469,107 @@ function MetricCard({
   )
 }
 
+/* ============================================================
+   MAIN APP
+   ============================================================ */
+
 function App() {
-  const [session, setSession] =
-    useState(null)
+  const [motionAnalysis, setMotionAnalysis] = useState(null)
+  useEffect(() => {
+    const receive = event => setMotionAnalysis(event.detail)
+    window.addEventListener('acupill-motion-analysis', receive)
+    return () => window.removeEventListener('acupill-motion-analysis', receive)
+  }, [])
 
-  const [loginRole, setLoginRole] =
-    useState('patient')
+  /* =========================================================
+     LOGIN
+     ========================================================= */
 
-  const [loginEmail, setLoginEmail] =
-    useState('')
+  const [
+    session,
+    setSession,
+  ] = useState(null)
+
+  const [
+    loginRole,
+    setLoginRole,
+  ] = useState('patient')
+
+  const [
+    loginEmail,
+    setLoginEmail,
+  ] = useState('')
 
   const [
     loginPassword,
     setLoginPassword,
   ] = useState('')
 
-  const [schedule, setSchedule] =
-    useState(() => loadSchedule())
+  /* =========================================================
+     SAVED DATA
+     ========================================================= */
 
-  const [now, setNow] =
-    useState(() => new Date())
+  const [
+    schedule,
+    setSchedule,
+  ] = useState(
+    () => loadSchedule()
+  )
 
-  const [connected, setConnected] =
-    useState(false)
+  const [
+    eventLog,
+    setEventLog,
+  ] = useState(
+    () => loadSavedEvents()
+  )
 
-  const [lastLine, setLastLine] =
-    useState('No data yet')
+  const [
+    majorChanges,
+    setMajorChanges,
+  ] = useState(
+    () => loadMajorChanges()
+  )
 
-  const [sensorData, setSensorData] =
-    useState({
-      t_ms: 0,
-      touch: 0,
-      ax: 0,
-      ay: 0,
-      az: 0,
-    })
+  const [
+    checkIns,
+    setCheckIns,
+  ] = useState(
+    () => loadCheckIns()
+  )
+
+  const [
+    now,
+    setNow,
+  ] = useState(
+    () => new Date()
+  )
+
+  /* =========================================================
+     DEVICE
+     ========================================================= */
+
+  const [
+    connected,
+    setConnected,
+  ] = useState(false)
+
+  const [
+    lastLine,
+    setLastLine,
+  ] = useState(
+    'No data yet'
+  )
+
+  const [
+    sensorData,
+    setSensorData,
+  ] = useState({
+    t_ms: 0,
+    touch: 0,
+    ax: 0,
+    ay: 0,
+    az: 0,
+  })
 
   const [
     movementState,
@@ -685,23 +1585,22 @@ function App() {
     az: 0,
   })
 
-  const [debug, setDebug] =
-    useState({
-      tiltAngleDegrees: 0,
-      motionAmount: 0,
-      isTilted: false,
-      isMoving: false,
-      isAtRest: false,
-      cooldownActive: false,
-    })
+  const [
+    debug,
+    setDebug,
+  ] = useState({
+    tiltAngleDegrees: 0,
+    motionAmount: 0,
+    isTilted: false,
+    isMoving: false,
+    isAtRest: false,
+    cooldownActive: false,
+  })
 
   const [
     stateHistory,
     setStateHistory,
   ] = useState([])
-
-  const [eventLog, setEventLog] =
-    useState(() => loadSavedEvents())
 
   const [
     rejectionLog,
@@ -712,6 +1611,26 @@ function App() {
     rotatingTermIndex,
     setRotatingTermIndex,
   ] = useState(0)
+
+  /* =========================================================
+     REFS
+     ========================================================= */
+
+  const eventLogRef =
+    useRef(eventLog)
+
+  const majorChangesRef =
+    useRef(majorChanges)
+
+  const initialDeviationSummary =
+    getRecentDeviationSummary(
+      eventLog
+    )
+
+  const majorChangeActiveRef =
+    useRef(
+      initialDeviationSummary.qualifies
+    )
 
   const restBaselineRef =
     useRef({
@@ -750,16 +1669,22 @@ function App() {
   const eventAlreadyDecidedRef =
     useRef(false)
 
-  const eventIdRef = useRef(
-    eventLog.length > 0
-      ? Math.max(
-          ...eventLog.map(
-            (event) =>
-              Number(event.id) || 0
-          )
-        ) + 1
-      : 1
-  )
+  const uploadFlushActiveRef =
+    useRef(false)
+
+  const eventIdRef =
+    useRef(
+      eventLog.length > 0
+        ? Math.max(
+            ...eventLog.map(
+              (event) =>
+                Number(
+                  event.id
+                ) || 0
+            )
+          ) + 1
+        : 1
+    )
 
   const rejectionIdRef =
     useRef(1)
@@ -767,12 +1692,67 @@ function App() {
   const lastEventTimeRef =
     useRef(-999999)
 
+  /* =========================================================
+     PERSISTENCE
+     ========================================================= */
+
+  async function flushPendingEventUploads() {
+    if (uploadFlushActiveRef.current) {
+      return
+    }
+
+    uploadFlushActiveRef.current = true
+
+    try {
+      await flushInteractionEventQueue()
+    } finally {
+      uploadFlushActiveRef.current = false
+    }
+  }
+
   useEffect(() => {
-    saveEvents(eventLog)
+    void flushPendingEventUploads()
+    const retry = () => { void flushPendingEventUploads() }
+    const timer = window.setInterval(retry, 15000)
+    window.addEventListener('online', retry)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('online', retry)
+    }
+  }, [])
+
+  useEffect(() => {
+    eventLogRef.current =
+      eventLog
+
+    saveArrayToStorage(
+      EVENT_STORAGE_KEY,
+      eventLog
+    )
   }, [eventLog])
 
   useEffect(() => {
-    saveSchedule(schedule)
+    majorChangesRef.current =
+      majorChanges
+
+    saveArrayToStorage(
+      MAJOR_CHANGE_STORAGE_KEY,
+      majorChanges
+    )
+  }, [majorChanges])
+
+  useEffect(() => {
+    saveArrayToStorage(
+      CHECKIN_STORAGE_KEY,
+      checkIns
+    )
+  }, [checkIns])
+
+  useEffect(() => {
+    saveArrayToStorage(
+      SCHEDULE_STORAGE_KEY,
+      schedule
+    )
   }, [schedule])
 
   useEffect(() => {
@@ -792,12 +1772,18 @@ function App() {
   useEffect(() => {
     const interval =
       setInterval(() => {
-        setNow(new Date())
+        setNow(
+          new Date()
+        )
       }, 30000)
 
     return () =>
       clearInterval(interval)
   }, [])
+
+  /* =========================================================
+     SCHEDULE DATA
+     ========================================================= */
 
   const nextMedication =
     getNextMedication(
@@ -822,29 +1808,27 @@ function App() {
 
   const weeklyTotals =
     weeklyRoutine.reduce(
-      (totals, day) => {
-        return {
-          scheduled:
-            totals.scheduled +
-            day.scheduled,
+      (totals, day) => ({
+        scheduled:
+          totals.scheduled +
+          day.scheduled,
 
-          recorded:
-            totals.recorded +
-            day.recorded,
+        recorded:
+          totals.recorded +
+          day.recorded,
 
-          late:
-            totals.late +
-            day.late,
+        late:
+          totals.late +
+          day.late,
 
-          missing:
-            totals.missing +
-            day.missing,
+        missing:
+          totals.missing +
+          day.missing,
 
-          pending:
-            totals.pending +
-            day.waiting,
-        }
-      },
+        pending:
+          totals.pending +
+          day.waiting,
+      }),
       {
         scheduled: 0,
         recorded: 0,
@@ -857,8 +1841,10 @@ function App() {
   const todayCompleted =
     todayRoutine.filter(
       (item) =>
-        item.status === 'recorded' ||
-        item.status === 'late'
+        item.status ===
+          'recorded' ||
+        item.status ===
+          'late'
     ).length
 
   function updateScheduleItem(
@@ -880,6 +1866,10 @@ function App() {
     )
   }
 
+  /* =========================================================
+     CURRENT BASELINE DISPLAY
+     ========================================================= */
+
   const latestEvent =
     eventLog[0] || null
 
@@ -898,7 +1888,8 @@ function App() {
   let baselineInsight =
     'Collect more valid interactions to build a personal baseline.'
 
-  let insightTone = 'neutral'
+  let insightTone =
+    'neutral'
 
   if (
     latestEvent &&
@@ -923,87 +1914,323 @@ function App() {
         baseline.motionVariability
       )
 
-    if (durationChange > 25) {
-      baselineInsight =
-        'Latest interaction was slower than the personal baseline.'
-
-      insightTone = 'warning'
-    } else if (
-      motionChange > 25 ||
-      variabilityChange > 25
+    if (
+      Math.abs(
+        durationChange
+      ) >
+        DURATION_DEVIATION_THRESHOLD ||
+      Math.abs(
+        motionChange
+      ) >
+        MOTION_DEVIATION_THRESHOLD ||
+      Math.abs(
+        variabilityChange
+      ) >
+        VARIABILITY_DEVIATION_THRESHOLD
     ) {
       baselineInsight =
-        'Latest interaction showed more movement variation than baseline.'
+        'Latest interaction differed from the recent personal baseline.'
 
-      insightTone = 'warning'
-    } else if (
-      durationChange < -25
-    ) {
-      baselineInsight =
-        'Latest interaction was faster than the personal baseline.'
-
-      insightTone = 'info'
+      insightTone =
+        'warning'
     } else {
       baselineInsight =
-        'Latest interaction looks close to the personal baseline.'
+        'Latest interaction looks close to the recent personal baseline.'
 
-      insightTone = 'good'
+      insightTone =
+        'good'
     }
   }
+
+  /* =========================================================
+     REPEATED DEVIATION
+     ========================================================= */
+
+  const recentDeviationSummary =
+    getRecentDeviationSummary(
+      eventLog
+    )
+
+  let repeatedDeviationText =
+    'Building comparable interaction history.'
+
+  if (
+    recentDeviationSummary
+      .comparableCount ===
+    MAJOR_CHANGE_WINDOW_SIZE
+  ) {
+    repeatedDeviationText =
+      `${recentDeviationSummary.unusualCount} of last ${MAJOR_CHANGE_WINDOW_SIZE} interactions outside baseline`
+  }
+
+  /* =========================================================
+     PATIENT MOVEMENT LANGUAGE
+
+     Patient is NOT shown raw thresholds.
+     ========================================================= */
 
   let patientMovementStatus =
     'Building your recent movement pattern.'
 
   if (
-    latestEvent &&
-    baseline &&
-    baseline.count >= 3
+    recentDeviationSummary
+      .comparableCount ===
+    MAJOR_CHANGE_WINDOW_SIZE
   ) {
-    const variabilityDifference =
-      Math.abs(
-        percentChange(
-          latestEvent.motionVariability,
-          baseline.motionVariability
-        )
-      )
-
-    const motionDifference =
-      Math.abs(
-        percentChange(
-          latestEvent.totalMotion,
-          baseline.totalMotion
-        )
-      )
-
     if (
-      variabilityDifference > 25 ||
-      motionDifference > 30
+      recentDeviationSummary.qualifies
     ) {
       patientMovementStatus =
-        'Your recent movement pattern has been a little different from usual.'
+        'Your recent medication-handling pattern has been a little different from usual.'
     } else {
       patientMovementStatus =
-        'Your recent movement pattern looks similar to your usual pattern.'
+        'Your recent medication-handling pattern looks similar to your usual routine.'
     }
   }
+
+  /* =========================================================
+     CAREGIVER "WHAT CHANGED?"
+     ========================================================= */
+
+  function buildWhatChangedText() {
+    const summary =
+      recentDeviationSummary
+
+    if (
+      summary.comparableCount <
+      MAJOR_CHANGE_WINDOW_SIZE
+    ) {
+      return (
+        `AcuPill needs ${MAJOR_CHANGE_WINDOW_SIZE} comparable interactions before repeated-change analysis is available.`
+      )
+    }
+
+    if (
+      summary.unusualCount === 0
+    ) {
+      return (
+        'The last five comparable interactions stayed within the current personal baseline ranges.'
+      )
+    }
+
+    const metrics = [
+      {
+        name:
+          'handling duration',
+        count:
+          summary.durationCount,
+      },
+      {
+        name:
+          'total motion',
+        count:
+          summary.motionCount,
+      },
+      {
+        name:
+          'movement variability',
+        count:
+          summary.variabilityCount,
+      },
+    ].sort(
+      (a, b) =>
+        b.count - a.count
+    )
+
+    const dominant =
+      metrics[0]
+
+    if (
+      summary.qualifies
+    ) {
+      return (
+        `${summary.unusualCount} of the last ${MAJOR_CHANGE_WINDOW_SIZE} comparable interactions were outside baseline. ` +
+        `${dominant.name} was the most frequently changed metric (${dominant.count} of ${MAJOR_CHANGE_WINDOW_SIZE}).`
+      )
+    }
+
+    return (
+      `${summary.unusualCount} of the last ${MAJOR_CHANGE_WINDOW_SIZE} comparable interactions were outside baseline. ` +
+      'The persistence threshold for a Major Change has not been reached.'
+    )
+  }
+
+  const whatChangedText =
+    buildWhatChangedText()
+
+  /* =========================================================
+     TRENDS
+     ========================================================= */
+
+  const trendEvents =
+    [...eventLog.slice(0, 10)]
+      .reverse()
+
+  const durationTrend =
+    trendEvents.map(
+      (event) =>
+        event.durationMs
+    )
+
+  const variabilityTrend =
+    trendEvents.map(
+      (event) =>
+        event.motionVariability
+    )
+
+  const averageMotionTrend =
+    trendEvents.map(
+      (event) =>
+        event.averageMotion
+    )
+
+  const peakMotionTrend =
+    trendEvents.map(
+      (event) =>
+        event.peakMotion
+    )
+
+  const tiltTrend =
+    trendEvents.map(
+      (event) =>
+        event.maxTiltAngle
+    )
+
+  /* =========================================================
+     CHECK-INS
+     ========================================================= */
+
+  function saveCheckIn(
+    response
+  ) {
+    const checkInTime =
+      new Date()
+
+    const checkIn = {
+      id:
+        `checkin-${Date.now()}`,
+
+      response,
+
+      recordedAtISO:
+        checkInTime.toISOString(),
+
+      recordedDate:
+        checkInTime.toLocaleDateString(),
+
+      clockTime:
+        checkInTime.toLocaleTimeString(),
+    }
+
+    setCheckIns(
+      (oldCheckIns) => [
+        checkIn,
+        ...oldCheckIns,
+      ].slice(0, 100)
+    )
+  }
+
+  const latestCheckIn =
+    checkIns[0] || null
+
+  /* =========================================================
+     MAJOR CHANGE ENGINE
+     ========================================================= */
+
+  function evaluateMajorChange(
+    updatedEvents,
+    triggerEvent
+  ) {
+    const summary =
+      getRecentDeviationSummary(
+        updatedEvents
+      )
+
+    /*
+      IMPORTANT:
+
+      If threshold falls below 3/5,
+      the current episode has reset.
+
+      A later 3/5 cluster may then
+      create a NEW Major Change.
+    */
+
+    if (!summary.qualifies) {
+      majorChangeActiveRef.current =
+        false
+
+      return
+    }
+
+    /*
+      We are already inside a surfaced
+      major-change episode.
+
+      Do NOT create another marker for
+      every overlapping 5-event window.
+    */
+
+    if (
+      majorChangeActiveRef.current
+    ) {
+      return
+    }
+
+    const marker =
+      createMajorChangeMarker(
+        summary,
+        triggerEvent
+      )
+
+    majorChangeActiveRef.current =
+      true
+
+    setMajorChanges(
+      (oldChanges) => {
+        const updated = [
+          marker,
+          ...oldChanges,
+        ].slice(0, 50)
+
+        majorChangesRef.current =
+          updated
+
+        return updated
+      }
+    )
+  }
+
+  /* =========================================================
+     LOGIN
+     ========================================================= */
 
   const rotatingTerm =
     ROTATING_TERMS[
       rotatingTermIndex
     ]
 
-  function handleLogin(event) {
+  function handleLogin(
+    event
+  ) {
     event.preventDefault()
 
-    setSession(loginRole)
+    setSession(
+      loginRole
+    )
 
     setLoginPassword('')
   }
 
   function signOut() {
     setSession(null)
+
     setLoginPassword('')
   }
+
+  /* =========================================================
+     DETECTION ENGINE
+     ========================================================= */
 
   function resetCounters() {
     handlingCountRef.current = 0
@@ -1048,13 +2275,19 @@ function App() {
         ),
 
       averageTiltAngle:
-        average(tiltValues),
+        average(
+          tiltValues
+        ),
 
       totalMotion:
-        sum(motionValues),
+        sum(
+          motionValues
+        ),
 
       averageMotion:
-        average(motionValues),
+        average(
+          motionValues
+        ),
 
       peakMotion:
         Math.max(
@@ -1119,6 +2352,13 @@ function App() {
     )
   }
 
+  /* =========================================================
+     VALID INTERACTION
+
+     THIS IS WHERE THE NEW BASELINE
+     AND 3-OF-5 LOGIC ENTERS.
+     ========================================================= */
+
   function tryLogMedicationInteraction(
     t_ms
   ) {
@@ -1131,7 +2371,9 @@ function App() {
     const interaction =
       currentInteractionRef.current
 
-    if (!interaction) return
+    if (!interaction) {
+      return
+    }
 
     const telemetry =
       calculateMotorTelemetry(
@@ -1218,6 +2460,25 @@ function App() {
       return
     }
 
+    /*
+      IMPORTANT:
+
+      eventLogRef.current contains ONLY
+      prior valid interactions.
+
+      We calculate the new interaction
+      against those prior events.
+    */
+
+    const priorEvents =
+      eventLogRef.current
+
+    const baselineComparison =
+      calculateEventBaselineComparison(
+        telemetry,
+        priorEvents
+      )
+
     const eventTime =
       new Date()
 
@@ -1241,6 +2502,15 @@ function App() {
         interaction.touchSeen,
 
       ...telemetry,
+
+      /*
+        NEW:
+        every valid event now remembers
+        how it compared with the baseline
+        that existed BEFORE it.
+      */
+
+      baselineComparison,
     }
 
     eventIdRef.current += 1
@@ -1251,11 +2521,75 @@ function App() {
     eventAlreadyDecidedRef.current =
       true
 
+    const updatedEvents = [
+      medicationEvent,
+      ...priorEvents,
+    ].slice(0, 100)
+
+    eventLogRef.current =
+      updatedEvents
+
     setEventLog(
-      (oldEvents) => [
-        medicationEvent,
-        ...oldEvents,
-      ].slice(0, 100)
+      updatedEvents
+    )
+
+    /*
+      The local detector remains authoritative for accepted-event
+      gating. Queue the accepted event for the API after that decision.
+      The same UUID is retained for safe backend retry handling.
+    */
+
+    queueInteractionEvent({
+      event_id: createApiEventId(),
+      patient_id: API_PATIENT_ID,
+      device_id: API_DEVICE_ID,
+      recorded_at: medicationEvent.recordedAtISO,
+      device_uptime_ms: Math.max(
+        0,
+        Math.round(medicationEvent.arduinoTime)
+      ),
+      detector_version: DETECTOR_VERSION,
+      duration_ms: Math.round(
+        medicationEvent.durationMs
+      ),
+      touch_seen: medicationEvent.touchSeen,
+      max_tilt_degrees: medicationEvent.maxTiltAngle,
+      average_tilt_degrees:
+        medicationEvent.averageTiltAngle,
+      total_motion_score:
+        medicationEvent.totalMotion,
+      average_motion_score:
+        medicationEvent.averageMotion,
+      peak_motion_score:
+        medicationEvent.peakMotion,
+      motion_variability_score:
+        medicationEvent.motionVariability,
+      sample_count: medicationEvent.sampleCount,
+
+      /* Context schema remains a separate shared service contract. */
+      baseline: null,
+      percent_changes: null,
+      schedule_match: null,
+    }, {
+      reference: { ...interaction.reference },
+      initial_sample: interaction.initialSample,
+      start_ms: interaction.startTime,
+      end_ms: t_ms,
+      samples: interaction.samples.map(({t_ms, ax, ay, az}) => ({t_ms, ax, ay, az})),
+    })
+
+    void flushPendingEventUploads()
+
+    /*
+      One unusual event is stored silently.
+
+      Only repeated unusual events may
+      create a Major Change.
+    */
+
+    evaluateMajorChange(
+      updatedEvents,
+      medicationEvent
     )
   }
 
@@ -1267,7 +2601,9 @@ function App() {
     const oldState =
       movementStateRef.current
 
-    if (oldState === newState) {
+    if (
+      oldState === newState
+    ) {
       return
     }
 
@@ -1277,7 +2613,9 @@ function App() {
     stateStartedAtRef.current =
       t_ms
 
-    setMovementState(newState)
+    setMovementState(
+      newState
+    )
 
     resetCounters()
 
@@ -1286,9 +2624,15 @@ function App() {
       newState === 'HANDLING'
     ) {
       currentInteractionRef.current = {
-        startTime: t_ms,
+        startTime:
+          t_ms,
+
         touchSeen:
           context.touch === 1,
+
+        // Freeze calibration and the trigger sample for exact first-delta parity.
+        reference: { ...restBaselineRef.current },
+        initialSample: { ...previousDataRef.current },
         samples: [],
       }
 
@@ -1365,11 +2709,14 @@ function App() {
 
     resetCounters()
 
-    setMovementState('IDLE')
+    setMovementState(
+      'IDLE'
+    )
 
     setStateHistory([
       {
         state: 'IDLE',
+
         time:
           sensorData.t_ms,
       },
@@ -1407,13 +2754,16 @@ function App() {
     if (previousData) {
       motionAmount =
         Math.abs(
-          ax - previousData.ax
+          ax -
+            previousData.ax
         ) +
         Math.abs(
-          ay - previousData.ay
+          ay -
+            previousData.ay
         ) +
         Math.abs(
-          az - previousData.az
+          az -
+            previousData.az
         )
     }
 
@@ -1445,7 +2795,9 @@ function App() {
     if (
       currentInteractionRef.current
     ) {
-      if (touch === 1) {
+      if (
+        touch === 1
+      ) {
         currentInteractionRef.current.touchSeen =
           true
       }
@@ -1493,7 +2845,8 @@ function App() {
       }
 
       if (
-        handlingCountRef.current >= 2 ||
+        handlingCountRef.current >=
+          2 ||
         isTilted
       ) {
         changeState(
@@ -1519,7 +2872,8 @@ function App() {
       }
 
       if (
-        timeInCurrentState >= 500 &&
+        timeInCurrentState >=
+          500 &&
         tiltCountRef.current >= 1
       ) {
         changeState(
@@ -1567,7 +2921,8 @@ function App() {
       }
 
       if (
-        timeInCurrentState >= 500 &&
+        timeInCurrentState >=
+          500 &&
         returnCountRef.current >= 2
       ) {
         changeState(
@@ -1596,8 +2951,10 @@ function App() {
       }
 
       if (
-        timeInCurrentState >= 1000 &&
-        idleCountRef.current >= 3
+        timeInCurrentState >=
+          1000 &&
+        idleCountRef.current >=
+          3
       ) {
         changeState(
           'IDLE',
@@ -1611,8 +2968,16 @@ function App() {
     }
   }
 
+  /* =========================================================
+     ARDUINO
+     ========================================================= */
+
   async function connectArduino() {
-    if (!('serial' in navigator)) {
+    if (
+      !(
+        'serial' in navigator
+      )
+    ) {
       alert(
         'Web Serial is not supported. Please use Google Chrome.'
       )
@@ -1646,9 +3011,12 @@ function App() {
         const {
           value,
           done,
-        } = await reader.read()
+        } =
+          await reader.read()
 
-        if (done) break
+        if (done) {
+          break
+        }
 
         buffer += value
 
@@ -1664,7 +3032,9 @@ function App() {
           const cleanLine =
             line.trim()
 
-          if (!cleanLine) continue
+          if (!cleanLine) {
+            continue
+          }
 
           setLastLine(
             cleanLine
@@ -1675,17 +3045,18 @@ function App() {
               cleanLine
             )
 
-          if (!parsed) continue
+          if (!parsed) {
+            continue
+          }
 
           setSensorData(
             parsed
           )
 
-          recentSamplesRef.current =
-            [
-              ...recentSamplesRef.current,
-              parsed,
-            ].slice(-12)
+          recentSamplesRef.current = [
+            ...recentSamplesRef.current,
+            parsed,
+          ].slice(-12)
 
           updateMovementState(
             parsed
@@ -1721,11 +3092,14 @@ function App() {
 
     resetCounters()
 
-    setMovementState('IDLE')
+    setMovementState(
+      'IDLE'
+    )
 
     setStateHistory([
       {
         state: 'IDLE',
+
         time:
           sensorData.t_ms,
       },
@@ -1735,10 +3109,15 @@ function App() {
   function clearEventLog() {
     setEventLog([])
 
+    eventLogRef.current = []
+
     eventIdRef.current = 1
 
     lastEventTimeRef.current =
       -999999
+
+    majorChangeActiveRef.current =
+      false
 
     localStorage.removeItem(
       EVENT_STORAGE_KEY
@@ -1750,6 +3129,36 @@ function App() {
 
     rejectionIdRef.current = 1
   }
+
+  function clearMajorChanges() {
+    setMajorChanges([])
+
+    majorChangesRef.current = []
+
+    majorChangeActiveRef.current =
+      getRecentDeviationSummary(
+        eventLogRef.current
+      ).qualifies
+
+    localStorage.removeItem(
+      MAJOR_CHANGE_STORAGE_KEY
+    )
+  }
+
+  /* =========================================================
+     APPOINTMENT SUMMARY
+     ========================================================= */
+
+  const latestMajorChange =
+    majorChanges[0] || null
+
+  function printAppointmentSummary() {
+    window.print()
+  }
+
+  /* =========================================================
+     LOGIN PAGE
+     ========================================================= */
 
   if (!session) {
     return (
@@ -1763,7 +3172,8 @@ function App() {
             </p>
 
             <h2>
-              Medication support built around{' '}
+              Medication support
+              built around{' '}
               <span
                 className="rotating-login-word"
                 key={rotatingTerm}
@@ -1774,16 +3184,27 @@ function App() {
             </h2>
 
             <p>
-              AcuPill helps patients maintain their medication
-              routine while preserving meaningful movement and
-              interaction history for caregivers and clinicians.
+              AcuPill helps patients
+              maintain their medication
+              routine while preserving
+              meaningful movement and
+              interaction history for
+              caregivers and clinicians.
             </p>
           </div>
 
           <div className="login-trust-row">
-            <span>Medication routine</span>
-            <span>Movement history</span>
-            <span>Appointment memory</span>
+            <span>
+              Medication routine
+            </span>
+
+            <span>
+              Movement history
+            </span>
+
+            <span>
+              Appointment memory
+            </span>
           </div>
         </div>
 
@@ -1798,19 +3219,23 @@ function App() {
             </h2>
 
             <p className="login-description">
-              Choose how you use AcuPill.
+              Choose how you use
+              AcuPill.
             </p>
 
             <div className="role-selector">
               <button
                 type="button"
                 className={
-                  loginRole === 'patient'
+                  loginRole ===
+                  'patient'
                     ? 'role-option active'
                     : 'role-option'
                 }
                 onClick={() =>
-                  setLoginRole('patient')
+                  setLoginRole(
+                    'patient'
+                  )
                 }
               >
                 <span className="role-icon">
@@ -1823,7 +3248,8 @@ function App() {
                   </strong>
 
                   <small>
-                    My routine & support
+                    My routine &
+                    support
                   </small>
                 </span>
               </button>
@@ -1831,12 +3257,15 @@ function App() {
               <button
                 type="button"
                 className={
-                  loginRole === 'caregiver'
+                  loginRole ===
+                  'caregiver'
                     ? 'role-option active'
                     : 'role-option'
                 }
                 onClick={() =>
-                  setLoginRole('caregiver')
+                  setLoginRole(
+                    'caregiver'
+                  )
                 }
               >
                 <span className="role-icon">
@@ -1849,14 +3278,17 @@ function App() {
                   </strong>
 
                   <small>
-                    Patient trends & insights
+                    Patient trends &
+                    insights
                   </small>
                 </span>
               </button>
             </div>
 
             <form
-              onSubmit={handleLogin}
+              onSubmit={
+                handleLogin
+              }
               className="login-form"
             >
               <label>
@@ -1864,14 +3296,20 @@ function App() {
 
                 <input
                   type="email"
-                  value={loginEmail}
-                  onChange={(event) =>
+                  value={
+                    loginEmail
+                  }
+                  onChange={(
+                    event
+                  ) =>
                     setLoginEmail(
-                      event.target.value
+                      event.target
+                        .value
                     )
                   }
                   placeholder={
-                    loginRole === 'patient'
+                    loginRole ===
+                    'patient'
                       ? 'patient@example.com'
                       : 'clinician@clinic.com'
                   }
@@ -1883,10 +3321,15 @@ function App() {
 
                 <input
                   type="password"
-                  value={loginPassword}
-                  onChange={(event) =>
+                  value={
+                    loginPassword
+                  }
+                  onChange={(
+                    event
+                  ) =>
                     setLoginPassword(
-                      event.target.value
+                      event.target
+                        .value
                     )
                   }
                   placeholder="••••••••"
@@ -1897,22 +3340,27 @@ function App() {
                 className="login-submit"
                 type="submit"
               >
-                {loginRole === 'patient'
+                {loginRole ===
+                'patient'
                   ? 'Continue to my dashboard'
                   : 'Continue to care dashboard'}
               </button>
             </form>
 
             <p className="demo-note">
-              Demo mode — authentication will be connected to the
-              backend later.
+              Demo mode —
+              authentication will be
+              connected to the backend
+              later.
             </p>
 
             <div className="engineering-access">
               <button
                 type="button"
                 onClick={() =>
-                  setSession('engineering')
+                  setSession(
+                    'engineering'
+                  )
                 }
               >
                 Engineering access
@@ -1924,31 +3372,39 @@ function App() {
     )
   }
 
+  /* =========================================================
+     LOGGED-IN APP
+     ========================================================= */
+
   return (
     <div className="app-shell">
       <header className="app-header">
         <LogoMark />
 
         <div className="app-header-right">
-          {session === 'patient' && (
+          {session ===
+            'patient' && (
             <span className="role-badge">
               Patient
             </span>
           )}
 
-          {session === 'caregiver' && (
+          {session ===
+            'caregiver' && (
             <span className="role-badge">
               Care Team / Clinic
             </span>
           )}
 
-          {session === 'engineering' && (
+          {session ===
+            'engineering' && (
             <span className="role-badge engineering-badge">
               Engineering
             </span>
           )}
 
-          {session === 'engineering' && (
+          {session ===
+            'engineering' && (
             <div
               className={
                 connected
@@ -1973,6 +3429,10 @@ function App() {
         </div>
       </header>
 
+      {/* =====================================================
+          PATIENT DASHBOARD
+          ===================================================== */}
+
       {session === 'patient' && (
         <main className="dashboard-view">
           <section className="patient-welcome">
@@ -1985,10 +3445,15 @@ function App() {
             </h2>
 
             <p className="patient-intro">
-              AcuPill helps track medication-bottle interactions
-              and remembers important changes between appointments.
+              AcuPill helps track
+              medication-bottle
+              interactions and remembers
+              important changes between
+              appointments.
             </p>
           </section>
+
+
 
           <section className="patient-grid">
             <div className="patient-feature">
@@ -2027,11 +3492,13 @@ function App() {
               </p>
 
               <p className="patient-big-value">
-                {todayCompleted}/{todayRoutine.length}
+                {todayCompleted}/
+                {todayRoutine.length}
               </p>
 
               <p className="patient-helper">
-                scheduled bottle interactions recorded
+                scheduled bottle
+                interactions recorded
               </p>
             </div>
 
@@ -2045,6 +3512,8 @@ function App() {
               </p>
             </div>
           </section>
+
+          {/* TODAY */}
 
           <section className="patient-section">
             <div className="section-heading">
@@ -2060,54 +3529,61 @@ function App() {
             </div>
 
             <div className="dose-routine-list">
-              {todayRoutine.map((item) => (
-                <div
-                  className="dose-routine-row"
-                  key={item.id}
-                >
-                  <div className="dose-time">
-                    {formatScheduleTime(
-                      item.time
-                    )}
-                  </div>
-
-                  <div className="dose-main">
-                    <strong>
-                      {item.label}
-                    </strong>
-
-                    {item.matchedDate ? (
-                      <p>
-                        Bottle interaction recorded at{' '}
-                        {item.matchedDate.toLocaleTimeString()}
-                      </p>
-                    ) : (
-                      <p>
-                        {item.status === 'upcoming'
-                          ? 'Scheduled for later today.'
-                          : item.status === 'waiting'
-                          ? 'No medication-bottle interaction has been recorded yet.'
-                          : 'No medication-bottle interaction was recorded during the monitoring window.'}
-                      </p>
-                    )}
-                  </div>
-
-                  <span
-                    className={`routine-status ${item.status}`}
+              {todayRoutine.map(
+                (item) => (
+                  <div
+                    className="dose-routine-row"
+                    key={item.id}
                   >
-                    {item.statusLabel}
-                  </span>
-                </div>
-              ))}
+                    <div className="dose-time">
+                      {formatScheduleTime(
+                        item.time
+                      )}
+                    </div>
+
+                    <div className="dose-main">
+                      <strong>
+                        {item.label}
+                      </strong>
+
+                      {item.matchedDate ? (
+                        <p>
+                          Bottle interaction
+                          recorded at{' '}
+                          {item.matchedDate.toLocaleTimeString()}
+                        </p>
+                      ) : (
+                        <p>
+                          {item.status ===
+                          'upcoming'
+                            ? 'Scheduled for later today.'
+                            : item.status ===
+                              'waiting'
+                            ? 'No medication-bottle interaction has been recorded yet.'
+                            : 'No medication-bottle interaction was recorded during the monitoring window.'}
+                        </p>
+                      )}
+                    </div>
+
+                    <span
+                      className={`routine-status ${item.status}`}
+                    >
+                      {item.statusLabel}
+                    </span>
+                  </div>
+                )
+              )}
             </div>
 
             <p className="schedule-note">
-              AcuPill detects medication-bottle interactions. It
-              does not confirm medication ingestion.
+              AcuPill detects
+              medication-bottle
+              interactions. It does not
+              confirm medication ingestion.
             </p>
           </section>
 
-          {/* NEW: PATIENT WEEKLY VIEW */}
+          {/* WEEKLY */}
 
           <section className="patient-section">
             <div className="section-heading">
@@ -2123,71 +3599,151 @@ function App() {
             </div>
 
             <div className="patient-week-grid">
-              {weeklyRoutine.map((day) => {
-                const isToday =
-                  isSameDay(
-                    day.date,
-                    now
+              {weeklyRoutine.map(
+                (day) => {
+                  const today =
+                    isSameDay(
+                      day.date,
+                      now
+                    )
+
+                  return (
+                    <div
+                      key={
+                        day.date.toISOString()
+                      }
+                      className={
+                        today
+                          ? 'patient-week-day today'
+                          : 'patient-week-day'
+                      }
+                    >
+                      <p className="week-day-name">
+                        {formatDayName(
+                          day.date
+                        )}
+                      </p>
+
+                      <p className="week-day-date">
+                        {formatShortDate(
+                          day.date
+                        )}
+                      </p>
+
+                      <div className="week-score">
+                        {day.completed}/
+                        {day.scheduled}
+                      </div>
+
+                      <div className="week-status-line">
+                        <span
+                          className={
+                            day.scheduled >
+                              0 &&
+                            day.completed ===
+                              day.scheduled
+                              ? 'week-dot complete'
+                              : day.missing >
+                                0
+                              ? 'week-dot different'
+                              : 'week-dot pending'
+                          }
+                        />
+
+                        <span>
+                          {day.scheduled ===
+                          0
+                            ? 'No schedule'
+                            : day.completed ===
+                              day.scheduled
+                            ? 'Recorded'
+                            : day.missing >
+                              0
+                            ? 'Some missing'
+                            : 'In progress'}
+                        </span>
+                      </div>
+                    </div>
                   )
+                }
+              )}
+            </div>
+          </section>
 
-                return (
-                  <div
-                    className={
-                      isToday
-                        ? 'patient-week-day today'
-                        : 'patient-week-day'
-                    }
-                    key={day.date.toISOString()}
-                  >
-                    <p className="week-day-name">
-                      {formatDayName(
-                        day.date
-                      )}
-                    </p>
+          {/* MAJOR CHANGE JOURNAL */}
 
-                    <p className="week-day-date">
-                      {formatShortDate(
-                        day.date
-                      )}
-                    </p>
+          <section className="patient-section">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Appointment Memory
+                </p>
 
-                    <div className="week-score">
-                      {day.completed}/
-                      {day.scheduled}
-                    </div>
-
-                    <div className="week-status-line">
-                      <span
-                        className={
-                          day.scheduled > 0 &&
-                          day.completed === day.scheduled
-                            ? 'week-dot complete'
-                            : day.missing > 0
-                            ? 'week-dot different'
-                            : 'week-dot pending'
-                        }
-                      />
-
-                      <span>
-                        {day.scheduled === 0
-                          ? 'No schedule'
-                          : day.completed === day.scheduled
-                          ? 'Recorded'
-                          : day.missing > 0
-                          ? 'Some missing'
-                          : 'In progress'}
-                      </span>
-                    </div>
-                  </div>
-                )
-              })}
+                <h2>
+                  Major changes
+                </h2>
+              </div>
             </div>
 
-            <p className="schedule-note">
-              This reflects recorded bottle interactions, not
-              confirmed medication ingestion.
-            </p>
+            {majorChanges.length ===
+            0 ? (
+              <div className="patient-message">
+                <strong>
+                  No repeated changes
+                  have been saved yet.
+                </strong>
+
+                <p>
+                  AcuPill watches for
+                  repeated differences
+                  rather than reacting to
+                  one unusual interaction.
+                </p>
+              </div>
+            ) : (
+              <div className="patient-routine-list">
+                {majorChanges.map(
+                  (change) => {
+                    const changeDate =
+                      new Date(
+                        change.createdAtISO
+                      )
+
+                    return (
+                      <div
+                        className="patient-routine-row"
+                        key={change.id}
+                      >
+                        <div>
+                          <strong>
+                            {formatLongDate(
+                              changeDate
+                            )}
+                          </strong>
+
+                          <p>
+                            Your
+                            medication-handling
+                            pattern was
+                            different from your
+                            recent routine.
+                            Saved for your next
+                            appointment.
+                          </p>
+                        </div>
+
+                        <span className="routine-status recorded">
+                          Saved
+                        </span>
+                      </div>
+                    )
+                  }
+                )}
+              </div>
+            )}
           </section>
+
+          {/* SCHEDULE */}
 
           <section className="patient-section">
             <div className="section-heading">
@@ -2203,101 +3759,95 @@ function App() {
             </div>
 
             <div className="schedule-list">
-              {schedule.map((item) => (
-                <div
-                  className="schedule-row"
-                  key={item.id}
-                >
-                  <div className="schedule-enabled">
-                    <input
-                      type="checkbox"
-                      checked={item.enabled}
-                      onChange={(event) =>
-                        updateScheduleItem(
-                          item.id,
-                          'enabled',
-                          event.target.checked
-                        )
-                      }
-                    />
-                  </div>
-
-                  <div className="schedule-fields">
-                    <label>
-                      Medication
-
+              {schedule.map(
+                (item) => (
+                  <div
+                    className="schedule-row"
+                    key={item.id}
+                  >
+                    <div className="schedule-enabled">
                       <input
-                        type="text"
-                        value={item.label}
-                        onChange={(event) =>
+                        type="checkbox"
+                        checked={
+                          item.enabled
+                        }
+                        onChange={(
+                          event
+                        ) =>
                           updateScheduleItem(
                             item.id,
-                            'label',
-                            event.target.value
+                            'enabled',
+                            event.target
+                              .checked
                           )
                         }
                       />
-                    </label>
+                    </div>
 
-                    <label>
-                      Time
+                    <div className="schedule-fields">
+                      <label>
+                        Medication
 
-                      <input
-                        type="time"
-                        value={item.time}
-                        onChange={(event) =>
-                          updateScheduleItem(
-                            item.id,
-                            'time',
-                            event.target.value
-                          )
-                        }
-                      />
-                    </label>
+                        <input
+                          type="text"
+                          value={
+                            item.label
+                          }
+                          onChange={(
+                            event
+                          ) =>
+                            updateScheduleItem(
+                              item.id,
+                              'label',
+                              event.target
+                                .value
+                            )
+                          }
+                        />
+                      </label>
+
+                      <label>
+                        Time
+
+                        <input
+                          type="time"
+                          value={
+                            item.time
+                          }
+                          onChange={(
+                            event
+                          ) =>
+                            updateScheduleItem(
+                              item.id,
+                              'time',
+                              event.target
+                                .value
+                            )
+                          }
+                        />
+                      </label>
+                    </div>
+
+                    <div className="schedule-preview">
+                      <strong>
+                        {formatScheduleTime(
+                          item.time
+                        )}
+                      </strong>
+
+                      <span>
+                        {item.enabled
+                          ? 'Active'
+                          : 'Paused'}
+                      </span>
+                    </div>
                   </div>
-
-                  <div className="schedule-preview">
-                    <strong>
-                      {formatScheduleTime(
-                        item.time
-                      )}
-                    </strong>
-
-                    <span>
-                      {item.enabled
-                        ? 'Active'
-                        : 'Paused'}
-                    </span>
-                  </div>
-                </div>
-              ))}
+                )
+              )}
             </div>
           </section>
 
-          <section className="patient-section">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">
-                  Appointment memory
-                </p>
-
-                <h2>
-                  Major changes
-                </h2>
-              </div>
-            </div>
-
-            <div className="patient-message">
-              <strong>
-                No major changes have been saved yet.
-              </strong>
-
-              <p>
-                AcuPill will quietly watch for repeated changes and
-                preserve meaningful dates for your next appointment.
-              </p>
-            </div>
-          </section>
+          {/* CHECK-IN */}
 
           <section className="patient-section">
             <div className="section-heading">
@@ -2307,30 +3857,80 @@ function App() {
                 </p>
 
                 <h2>
-                  How did handling your medication feel today?
+                  How did handling your
+                  medication feel today?
                 </h2>
               </div>
             </div>
 
             <div className="checkin-options">
-              <button className="checkin-button">
+              <button
+                className="checkin-button"
+                onClick={() =>
+                  saveCheckIn(
+                    'Easy'
+                  )
+                }
+              >
                 Easy
               </button>
 
-              <button className="checkin-button">
+              <button
+                className="checkin-button"
+                onClick={() =>
+                  saveCheckIn(
+                    'A little difficult'
+                  )
+                }
+              >
                 A little difficult
               </button>
 
-              <button className="checkin-button">
+              <button
+                className="checkin-button"
+                onClick={() =>
+                  saveCheckIn(
+                    'Difficult'
+                  )
+                }
+              >
                 Difficult
               </button>
             </div>
+
+            {latestCheckIn && (
+              <p className="schedule-note">
+                Latest check-in:{' '}
+                <strong>
+                  {latestCheckIn.response}
+                </strong>{' '}
+                at{' '}
+                {latestCheckIn.clockTime}
+              </p>
+            )}
           </section>
         </main>
       )}
 
-      {session === 'caregiver' && (
+      {/* =====================================================
+          CAREGIVER / CLINICIAN
+          ===================================================== */}
+
+      {session ===
+        'caregiver' && (
         <main className="dashboard-view">
+          <CaregiverMockPreview />
+
+          <details className="section-block">
+            <summary>
+              Current device session — existing caregiver view
+            </summary>
+
+            <p className="demo-note">
+              The following view uses local device-session data,
+              separate from the mock preview above.
+            </p>
+
           <section className="caregiver-summary">
             <div>
               <p className="eyebrow">
@@ -2342,8 +3942,11 @@ function App() {
               </h2>
 
               <p className="patient-intro">
-                Review medication interaction history and changes
-                in handling patterns over time.
+                Review medication
+                interaction patterns,
+                repeated deviations, and
+                longitudinal movement
+                telemetry.
               </p>
             </div>
 
@@ -2351,21 +3954,49 @@ function App() {
               className={`caregiver-callout ${insightTone}`}
             >
               <p className="card-label">
-                Current insight
+                Repeated-deviation
+                indicator
               </p>
 
               <strong>
-                {baselineInsight}
+                {repeatedDeviationText}
               </strong>
 
               <p className="tiny-text">
-                Experimental comparison only. Not a medical
-                diagnosis.
+                Major Change threshold:
+                3 of last 5 comparable
+                interactions.
               </p>
             </div>
           </section>
 
-          {/* NEW: CAREGIVER 7 DAY SUMMARY */}
+          {/* WHAT CHANGED */}
+
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Pattern summary
+                </p>
+
+                <h2>
+                  What changed?
+                </h2>
+              </div>
+            </div>
+
+            <div className="patient-message">
+              <strong>
+                {baselineInsight}
+              </strong>
+
+              <p>
+                {whatChangedText}
+              </p>
+            </div>
+          </section>
+
+          {/* WEEK ROUTINE */}
 
           <section className="section-block">
             <div className="section-heading">
@@ -2375,7 +4006,8 @@ function App() {
                 </p>
 
                 <h2>
-                  Medication interaction routine
+                  Medication interaction
+                  routine
                 </h2>
               </div>
             </div>
@@ -2383,22 +4015,30 @@ function App() {
             <div className="routine-summary-grid">
               <MetricCard
                 label="Scheduled"
-                value={weeklyTotals.scheduled}
+                value={
+                  weeklyTotals.scheduled
+                }
               />
 
               <MetricCard
                 label="Recorded"
-                value={weeklyTotals.recorded}
+                value={
+                  weeklyTotals.recorded
+                }
               />
 
               <MetricCard
                 label="Recorded late"
-                value={weeklyTotals.late}
+                value={
+                  weeklyTotals.late
+                }
               />
 
               <MetricCard
                 label="No interaction"
-                value={weeklyTotals.missing}
+                value={
+                  weeklyTotals.missing
+                }
               />
             </div>
 
@@ -2418,98 +4058,258 @@ function App() {
                 <tbody>
                   {[...weeklyRoutine]
                     .reverse()
-                    .map((day) => (
-                      <tr
-                        key={day.date.toISOString()}
-                      >
-                        <td>
-                          <strong>
-                            {formatDayName(
+                    .map(
+                      (day) => (
+                        <tr
+                          key={
+                            day.date.toISOString()
+                          }
+                        >
+                          <td>
+                            <strong>
+                              {formatDayName(
+                                day.date
+                              )}
+                            </strong>{' '}
+                            {formatShortDate(
                               day.date
                             )}
-                          </strong>{' '}
-                          {formatShortDate(
-                            day.date
-                          )}
-                        </td>
+                          </td>
 
-                        <td>
-                          {day.scheduled}
-                        </td>
+                          <td>
+                            {day.scheduled}
+                          </td>
 
-                        <td>
-                          {day.recorded}
-                        </td>
+                          <td>
+                            {day.recorded}
+                          </td>
 
-                        <td>
-                          {day.late}
-                        </td>
+                          <td>
+                            {day.late}
+                          </td>
 
-                        <td>
-                          {day.missing}
-                        </td>
+                          <td>
+                            {day.missing}
+                          </td>
 
-                        <td>
-                          {day.waiting}
-                        </td>
-                      </tr>
-                    ))}
+                          <td>
+                            {day.waiting}
+                          </td>
+                        </tr>
+                      )
+                    )}
                 </tbody>
               </table>
             </div>
 
             <p className="schedule-note">
-              These statuses describe recorded medication-bottle
+              These statuses describe
+              recorded medication-bottle
               interactions only.
             </p>
           </section>
+
+          {/* TELEMETRY TRENDS */}
 
           <section className="section-block">
             <div className="section-heading">
               <div>
                 <p className="eyebrow">
-                  Today
+                  Last 10 valid
+                  interactions
                 </p>
 
                 <h2>
-                  Medication routine
+                  Handling trends
                 </h2>
               </div>
             </div>
 
-            <div className="dose-routine-list">
-              {todayRoutine.map((item) => (
-                <div
-                  className="dose-routine-row"
-                  key={item.id}
-                >
-                  <div className="dose-time">
-                    {formatScheduleTime(
-                      item.time
-                    )}
-                  </div>
+            <div className="metric-grid">
+              <TrendCard
+                label="Handling duration"
+                values={
+                  durationTrend
+                }
+                formatter={(
+                  value
+                ) =>
+                  `${Math.round(
+                    value
+                  )} ms`
+                }
+              />
 
-                  <div className="dose-main">
-                    <strong>
-                      {item.label}
-                    </strong>
+              <TrendCard
+                label="Movement variability"
+                values={
+                  variabilityTrend
+                }
+                formatter={(
+                  value
+                ) =>
+                  value.toFixed(3)
+                }
+              />
 
-                    <p>
-                      {item.matchedDate
-                        ? `Interaction: ${item.matchedDate.toLocaleTimeString()}`
-                        : 'No matched bottle interaction'}
-                    </p>
-                  </div>
+              <TrendCard
+                label="Average motion"
+                values={
+                  averageMotionTrend
+                }
+                formatter={(
+                  value
+                ) =>
+                  value.toFixed(3)
+                }
+              />
 
-                  <span
-                    className={`routine-status ${item.status}`}
-                  >
-                    {item.statusLabel}
-                  </span>
-                </div>
-              ))}
+              <TrendCard
+                label="Peak motion"
+                values={
+                  peakMotionTrend
+                }
+                formatter={(
+                  value
+                ) =>
+                  value.toFixed(3)
+                }
+              />
+
+              <TrendCard
+                label="Max tilt"
+                values={
+                  tiltTrend
+                }
+                formatter={(
+                  value
+                ) =>
+                  `${value.toFixed(
+                    1
+                  )}°`
+                }
+              />
             </div>
           </section>
+
+          {/* MAJOR CHANGE TIMELINE */}
+
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Longitudinal change
+                  record
+                </p>
+
+                <h2>
+                  Major Change timeline
+                </h2>
+              </div>
+
+              <button
+                className="danger-button"
+                onClick={
+                  clearMajorChanges
+                }
+                disabled={
+                  majorChanges.length ===
+                  0
+                }
+              >
+                Clear markers
+              </button>
+            </div>
+
+            {majorChanges.length ===
+            0 ? (
+              <div className="empty-card">
+                No Major Change markers
+                have been generated yet.
+              </div>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>
+                        Repeated deviation
+                      </th>
+                      <th>
+                        Duration
+                      </th>
+                      <th>
+                        Total motion
+                      </th>
+                      <th>
+                        Variability
+                      </th>
+                      <th>
+                        Events
+                      </th>
+                    </tr>
+                  </thead>
+
+                  <tbody>
+                    {majorChanges.map(
+                      (change) => (
+                        <tr
+                          key={
+                            change.id
+                          }
+                        >
+                          <td>
+                            {formatLongDate(
+                              new Date(
+                                change.createdAtISO
+                              )
+                            )}
+                          </td>
+
+                          <td>
+                            {
+                              change.unusualCount
+                            }{' '}
+                            of{' '}
+                            {
+                              change.windowSize
+                            }
+                          </td>
+
+                          <td>
+                            {formatPercent(
+                              change.averageDurationPct
+                            )}
+                          </td>
+
+                          <td>
+                            {formatPercent(
+                              change.averageTotalMotionPct
+                            )}
+                          </td>
+
+                          <td>
+                            {formatPercent(
+                              change.averageVariabilityPct
+                            )}
+                          </td>
+
+                          <td>
+                            {change.eventIds.join(
+                              ', '
+                            )}
+                          </td>
+                        </tr>
+                      )
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          {/* LATEST */}
 
           <section className="section-block">
             <div className="section-heading">
@@ -2529,7 +4329,7 @@ function App() {
                 <MetricCard
                   label="Status"
                   value="Detected"
-                  subtext="Possible medication interaction"
+                  subtext="Medication-bottle interaction"
                 />
 
                 <MetricCard
@@ -2564,20 +4364,30 @@ function App() {
                 />
 
                 <MetricCard
-                  label="Touch seen"
+                  label="Baseline status"
                   value={
-                    latestEvent.touchSeen
-                      ? 'Yes'
-                      : 'No'
+                    !latestEvent
+                      .baselineComparison
+                      ?.hasBaseline
+                      ? 'Building'
+                      : latestEvent
+                          .baselineComparison
+                          .outsideBaseline
+                      ? 'Outside range'
+                      : 'Within range'
                   }
                 />
               </div>
             ) : (
               <div className="empty-card">
-                No medication interaction has been detected yet.
+                No medication-bottle
+                interaction has been
+                detected yet.
               </div>
             )}
           </section>
+
+          {/* BASELINE */}
 
           <section className="section-block two-column">
             <div>
@@ -2586,14 +4396,16 @@ function App() {
               </p>
 
               <h2>
-                Normal handling pattern
+                Handling pattern
               </h2>
 
               {baseline ? (
                 <div className="mini-grid">
                   <MetricCard
                     label="Events"
-                    value={baseline.count}
+                    value={
+                      baseline.count
+                    }
                   />
 
                   <MetricCard
@@ -2611,7 +4423,7 @@ function App() {
                   />
 
                   <MetricCard
-                    label="Avg motion"
+                    label="Avg total motion"
                     value={baseline.totalMotion.toFixed(
                       3
                     )}
@@ -2626,15 +4438,14 @@ function App() {
                 </div>
               ) : (
                 <p>
-                  No baseline yet. Complete several valid
-                  interactions.
+                  No baseline yet.
                 </p>
               )}
             </div>
 
             <div>
               <p className="eyebrow">
-                Comparison
+                Latest comparison
               </p>
 
               <h2>
@@ -2643,7 +4454,8 @@ function App() {
 
               {latestEvent &&
               baseline &&
-              baseline.count >= 3 ? (
+              baseline.count >=
+                3 ? (
                 <div className="comparison-list">
                   <p>
                     Duration change
@@ -2656,7 +4468,8 @@ function App() {
                   </p>
 
                   <p>
-                    Total motion change
+                    Total motion
+                    change
 
                     <strong>
                       {formatPercent(
@@ -2677,12 +4490,186 @@ function App() {
                 </div>
               ) : (
                 <p>
-                  At least four valid events are needed before
-                  baseline comparison is available.
+                  More interactions are
+                  needed.
                 </p>
               )}
             </div>
           </section>
+
+          {/* PATIENT CHECK-INS */}
+
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Patient-reported
+                  context
+                </p>
+
+                <h2>
+                  Recent check-ins
+                </h2>
+              </div>
+            </div>
+
+            {checkIns.length ===
+            0 ? (
+              <div className="empty-card">
+                No patient check-ins
+                recorded yet.
+              </div>
+            ) : (
+              <div className="table-wrap state-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Time</th>
+                      <th>Response</th>
+                    </tr>
+                  </thead>
+
+                  <tbody>
+                    {checkIns
+                      .slice(0, 10)
+                      .map(
+                        (checkIn) => (
+                          <tr
+                            key={
+                              checkIn.id
+                            }
+                          >
+                            <td>
+                              {
+                                checkIn.recordedDate
+                              }
+                            </td>
+
+                            <td>
+                              {
+                                checkIn.clockTime
+                              }
+                            </td>
+
+                            <td>
+                              {
+                                checkIn.response
+                              }
+                            </td>
+                          </tr>
+                        )
+                      )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          {/* APPOINTMENT SUMMARY */}
+
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Appointment report
+                </p>
+
+                <h2>
+                  Appointment summary
+                </h2>
+              </div>
+
+              <button
+                className="primary-button"
+                onClick={
+                  printAppointmentSummary
+                }
+              >
+                Print summary
+              </button>
+            </div>
+
+            <div className="patient-message">
+              <strong>
+                7-day routine
+              </strong>
+
+              <p>
+                {
+                  weeklyTotals.recorded
+                }{' '}
+                recorded on time,{' '}
+                {
+                  weeklyTotals.late
+                }{' '}
+                recorded late, and{' '}
+                {
+                  weeklyTotals.missing
+                }{' '}
+                scheduled
+                medication-bottle
+                interactions with no
+                recorded interaction.
+              </p>
+            </div>
+
+            <div className="patient-message">
+              <strong>
+                Movement pattern
+              </strong>
+
+              <p>
+                {repeatedDeviationText}.
+              </p>
+            </div>
+
+            <div className="patient-message">
+              <strong>
+                Appointment Memory
+              </strong>
+
+              <p>
+                {majorChanges.length ===
+                0
+                  ? 'No Major Change markers have been saved.'
+                  : `${majorChanges.length} Major Change marker${
+                      majorChanges.length ===
+                      1
+                        ? ''
+                        : 's'
+                    } saved. Most recent: ${formatLongDate(
+                      new Date(
+                        latestMajorChange.createdAtISO
+                      )
+                    )}.`}
+              </p>
+            </div>
+
+            <div className="patient-message">
+              <strong>
+                Patient check-in
+              </strong>
+
+              <p>
+                {latestCheckIn
+                  ? `Most recent response: ${latestCheckIn.response} on ${latestCheckIn.recordedDate}.`
+                  : 'No patient-reported handling difficulty has been recorded yet.'}
+              </p>
+            </div>
+
+            <p className="schedule-note">
+              AcuPill describes
+              medication-bottle
+              interactions and movement
+              patterns. These measurements
+              are not a diagnosis and do
+              not confirm medication
+              ingestion.
+            </p>
+          </section>
+
+          {/* COMPLETE EVENT HISTORY */}
 
           <section className="section-block">
             <div className="section-heading">
@@ -2698,14 +4685,19 @@ function App() {
 
               <button
                 className="danger-button"
-                onClick={clearEventLog}
-                disabled={eventLog.length === 0}
+                onClick={
+                  clearEventLog
+                }
+                disabled={
+                  eventLog.length === 0
+                }
               >
                 Clear history
               </button>
             </div>
 
-            {eventLog.length === 0 ? (
+            {eventLog.length ===
+            0 ? (
               <div className="empty-card">
                 No saved interactions yet.
               </div>
@@ -2718,22 +4710,25 @@ function App() {
                       <th>Date</th>
                       <th>Time</th>
                       <th>Duration</th>
-                      <th>Touch</th>
                       <th>Max tilt</th>
-                      <th>Avg tilt</th>
                       <th>Total motion</th>
                       <th>Avg motion</th>
                       <th>Peak motion</th>
                       <th>Variability</th>
-                      <th>Samples</th>
+                      <th>Baseline</th>
                     </tr>
                   </thead>
 
                   <tbody>
                     {eventLog.map(
-                      (event, index) => (
+                      (
+                        event,
+                        index
+                      ) => (
                         <tr
-                          key={event.id}
+                          key={
+                            event.id
+                          }
                           className={
                             index === 0
                               ? 'fresh'
@@ -2760,22 +4755,8 @@ function App() {
                           </td>
 
                           <td>
-                            {event.touchSeen
-                              ? 'Yes'
-                              : 'No'}
-                          </td>
-
-                          <td>
                             {formatNumber(
                               event.maxTiltAngle,
-                              1
-                            )}
-                            °
-                          </td>
-
-                          <td>
-                            {formatNumber(
-                              event.averageTiltAngle,
                               1
                             )}
                             °
@@ -2810,7 +4791,15 @@ function App() {
                           </td>
 
                           <td>
-                            {event.sampleCount}
+                            {!event
+                              .baselineComparison
+                              ?.hasBaseline
+                              ? 'Building'
+                              : event
+                                  .baselineComparison
+                                  .outsideBaseline
+                              ? 'Outside'
+                              : 'Within'}
                           </td>
                         </tr>
                       )
@@ -2820,28 +4809,16 @@ function App() {
               </div>
             )}
           </section>
-
-          <section className="section-block">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">
-                  Major change timeline
-                </p>
-
-                <h2>
-                  Appointment Memory
-                </h2>
-              </div>
-            </div>
-
-            <div className="empty-card">
-              Repeated-change detection will be added next.
-            </div>
-          </section>
+        </details>
         </main>
       )}
 
-      {session === 'engineering' && (
+      {/* =====================================================
+          ENGINEERING
+          ===================================================== */}
+
+      {session ===
+        'engineering' && (
         <main className="dashboard-view">
           <section className="engineering-header">
             <p className="eyebrow">
@@ -2849,15 +4826,28 @@ function App() {
             </p>
 
             <h2 className="caregiver-title">
-              Device & detection diagnostics
+              Device & detection
+              diagnostics
             </h2>
 
             <p>
-              Raw sensor information and detector controls are kept
-              separate from the patient experience.
+              Raw sensor information,
+              thresholds, and detector
+              controls are kept separate
+              from the patient experience.
             </p>
           </section>
 
+          <section aria-label="Completed session analysis">
+            <p className="card-label">Completed session analysis</p>
+            <p>{motionAnalysis
+              ? `Latest metrics: ${motionAnalysis.metrics_source === 'matlab' ? 'MATLAB' : 'JavaScript fallback'}`
+              : 'Waiting for a new accepted interaction.'}</p>
+            {motionAnalysis && <p className="tiny-text">
+              Average jerk: {motionAnalysis.average_jerk?.toFixed(3) ?? 'Unavailable'} ·
+              Peak jerk: {motionAnalysis.peak_jerk?.toFixed(3) ?? 'Unavailable'} (sensor units/s)
+            </p>}
+          </section>
           <section className="engineering-top-grid">
             <div className="engineering-feature">
               <p className="card-label">
@@ -2872,14 +4862,19 @@ function App() {
 
               <button
                 className="primary-button"
-                onClick={connectArduino}
-                disabled={connected}
+                onClick={
+                  connectArduino
+                }
+                disabled={
+                  connected
+                }
               >
                 Connect Arduino
               </button>
 
               <p className="tiny-text">
-                Expected stream: t_ms,touch,ax,ay,az
+                Expected:
+                t_ms,touch,ax,ay,az
               </p>
             </div>
 
@@ -2889,20 +4884,25 @@ function App() {
               </p>
 
               <h2
-                key={sensorData.touch}
+                key={
+                  sensorData.touch
+                }
                 className={
-                  sensorData.touch === 1
+                  sensorData.touch ===
+                  1
                     ? 'touch-active tick'
                     : 'touch-idle tick'
                 }
               >
-                {sensorData.touch === 1
+                {sensorData.touch ===
+                1
                   ? 'Touch active'
                   : 'Not touched'}
               </h2>
 
               <p className="tiny-text">
-                Raw touch: {sensorData.touch}
+                Raw touch:{' '}
+                {sensorData.touch}
               </p>
             </div>
 
@@ -2912,7 +4912,9 @@ function App() {
               </p>
 
               <h2
-                key={movementState}
+                key={
+                  movementState
+                }
                 className="state-text tick"
               >
                 {movementState}
@@ -2920,7 +4922,9 @@ function App() {
 
               <button
                 className="secondary-button"
-                onClick={resetState}
+                onClick={
+                  resetState
+                }
               >
                 Reset state
               </button>
@@ -2939,7 +4943,8 @@ function App() {
                 </p>
 
                 <p>
-                  Time: {sensorData.t_ms} ms
+                  Time:{' '}
+                  {sensorData.t_ms} ms
                 </p>
 
                 <p>
@@ -2961,21 +4966,34 @@ function App() {
                 </h3>
 
                 <p>
-                  Rest X: {restBaseline.ax.toFixed(3)}
+                  Rest X:{' '}
+                  {restBaseline.ax.toFixed(
+                    3
+                  )}
                 </p>
 
                 <p>
-                  Rest Y: {restBaseline.ay.toFixed(3)}
+                  Rest Y:{' '}
+                  {restBaseline.ay.toFixed(
+                    3
+                  )}
                 </p>
 
                 <p>
-                  Rest Z: {restBaseline.az.toFixed(3)}
+                  Rest Z:{' '}
+                  {restBaseline.az.toFixed(
+                    3
+                  )}
                 </p>
 
                 <button
                   className="secondary-button"
-                  onClick={calibrateRest}
-                  disabled={!connected}
+                  onClick={
+                    calibrateRest
+                  }
+                  disabled={
+                    !connected
+                  }
                 >
                   Calibrate rest
                 </button>
@@ -2987,31 +5005,100 @@ function App() {
                 </h3>
 
                 <p>
-                  Tilt angle: {debug.tiltAngleDegrees.toFixed(1)}°
+                  Tilt:{' '}
+                  {debug.tiltAngleDegrees.toFixed(
+                    1
+                  )}
+                  °
                 </p>
 
                 <p>
-                  Motion: {debug.motionAmount.toFixed(3)}
+                  Motion:{' '}
+                  {debug.motionAmount.toFixed(
+                    3
+                  )}
                 </p>
 
                 <p>
-                  Tilted: {debug.isTilted ? 'Yes' : 'No'}
+                  Tilted:{' '}
+                  {debug.isTilted
+                    ? 'Yes'
+                    : 'No'}
                 </p>
 
                 <p>
-                  Moving: {debug.isMoving ? 'Yes' : 'No'}
+                  Moving:{' '}
+                  {debug.isMoving
+                    ? 'Yes'
+                    : 'No'}
                 </p>
 
                 <p>
-                  At rest: {debug.isAtRest ? 'Yes' : 'No'}
+                  At rest:{' '}
+                  {debug.isAtRest
+                    ? 'Yes'
+                    : 'No'}
                 </p>
 
                 <p>
-                  Cooldown: {debug.cooldownActive ? 'Active' : 'No'}
+                  Cooldown:{' '}
+                  {debug.cooldownActive
+                    ? 'Active'
+                    : 'No'}
                 </p>
               </div>
             </div>
           </section>
+
+          {/* MAJOR CHANGE SETTINGS */}
+
+          <section className="section-block">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">
+                  Appointment Memory
+                  detector
+                </p>
+
+                <h2>
+                  Persistence thresholds
+                </h2>
+              </div>
+            </div>
+
+            <div className="metric-grid">
+              <MetricCard
+                label="Duration"
+                value={`>${DURATION_DEVIATION_THRESHOLD}%`}
+              />
+
+              <MetricCard
+                label="Total motion"
+                value={`>${MOTION_DEVIATION_THRESHOLD}%`}
+              />
+
+              <MetricCard
+                label="Variability"
+                value={`>${VARIABILITY_DEVIATION_THRESHOLD}%`}
+              />
+
+              <MetricCard
+                label="Persistence"
+                value={`${MAJOR_CHANGE_REQUIRED_COUNT}/${MAJOR_CHANGE_WINDOW_SIZE}`}
+                subtext="Outside baseline"
+              />
+
+              <MetricCard
+                label="Baseline minimum"
+                value={
+                  MIN_BASELINE_EVENTS
+                }
+                subtext="Prior events"
+              />
+            </div>
+          </section>
+
+          {/* REJECTIONS */}
 
           <section className="section-block">
             <div className="section-heading">
@@ -3026,9 +5113,10 @@ function App() {
               </div>
             </div>
 
-            {rejectionLog.length === 0 ? (
+            {rejectionLog.length ===
+            0 ? (
               <div className="empty-card">
-                No rejected interactions yet.
+                No rejected interactions.
               </div>
             ) : (
               <div className="table-wrap">
@@ -3040,7 +5128,7 @@ function App() {
                       <th>Duration</th>
                       <th>Touch</th>
                       <th>Max tilt</th>
-                      <th>Clock time</th>
+                      <th>Clock</th>
                     </tr>
                   </thead>
 
@@ -3048,7 +5136,9 @@ function App() {
                     {rejectionLog.map(
                       (rejection) => (
                         <tr
-                          key={rejection.id}
+                          key={
+                            rejection.id
+                          }
                         >
                           <td>
                             {rejection.id}
@@ -3091,12 +5181,19 @@ function App() {
 
             <button
               className="secondary-button"
-              onClick={clearRejectionLog}
-              disabled={rejectionLog.length === 0}
+              onClick={
+                clearRejectionLog
+              }
+              disabled={
+                rejectionLog.length ===
+                0
+              }
             >
               Clear rejections
             </button>
           </section>
+
+          {/* STATE HISTORY */}
 
           <section className="section-block">
             <div className="section-heading">
@@ -3111,7 +5208,8 @@ function App() {
               </div>
             </div>
 
-            {stateHistory.length === 0 ? (
+            {stateHistory.length ===
+            0 ? (
               <div className="empty-card">
                 No state changes yet.
               </div>
@@ -3127,8 +5225,13 @@ function App() {
 
                   <tbody>
                     {stateHistory.map(
-                      (entry, index) => (
-                        <tr key={index}>
+                      (
+                        entry,
+                        index
+                      ) => (
+                        <tr
+                          key={index}
+                        >
                           <td>
                             {entry.state}
                           </td>
