@@ -10,4 +10,13 @@ The event API and SQL migration are prepared; browser wiring and real-device/dat
 
 The API uses fixed demo patient/device scope and binds only to loopback. It has no production login/authentication. The database is authoritative for received_at. Event ID reuse with changed content is rejected. JSON context fields currently accept objects; tighten their schemas when baseline/schedule/3-of-5 implementations are shared. Do not expose this development API publicly.
 
-Acceptance still required: real bottle event → POST → database row → GET → both dashboards; retry produces one row; rejected attempt produces none; database failure stays visibly pending; refresh retrieves the row. No live database migration has been run by this change.
+Acceptance still required: real bottle event → POST → database row → GET → both dashboards; retry produces one row; rejected attempt produces none; database failure stays visibly pending; refresh retrieves the row. The migration was run through Tiger Cloud SQL Editor and all four tables, including the interaction hypertable, were verified. Local TLS connection and API round-trip testing remain pending.
+
+## Local startup
+
+Run `npm run db:check` to verify TLS and the schema without exposing credentials.
+Run `npm run server` in one terminal and `npm run dev` in another.
+The UI should use relative `/api/events` URLs; Vite forwards `/api` to port 3001.
+`GET /api/health` returns 200 only when the database is reachable, otherwise 503.
+Both servers are for local development. Port 5173 is fixed to match the current origin check.
+No database credentials belong in frontend configuration.

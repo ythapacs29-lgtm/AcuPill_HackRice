@@ -5,7 +5,9 @@ const { DATABASE_URL, ACUPILL_PATIENT_ID, ACUPILL_DEVICE_ID } = process.env
 if (!DATABASE_URL || !ACUPILL_PATIENT_ID || !ACUPILL_DEVICE_ID) {
   throw new Error('Set DATABASE_URL, ACUPILL_PATIENT_ID and ACUPILL_DEVICE_ID in server/.env')
 }
-const pool = new pg.Pool({ connectionString: DATABASE_URL })
+const databaseUrl = new URL(DATABASE_URL)
+databaseUrl.searchParams.set('sslmode', 'verify-full')
+const pool = new pg.Pool({ connectionString: databaseUrl.toString(), connectionTimeoutMillis: 10000, query_timeout: 10000 })
 const fields = ['event_id','patient_id','device_id','recorded_at','device_uptime_ms','detector_version','duration_ms','touch_seen','max_tilt_degrees','average_tilt_degrees','total_motion_score','average_motion_score','peak_motion_score','motion_variability_score','sample_count','baseline','percent_changes','schedule_match']
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 function validate(e) {
@@ -24,6 +26,12 @@ const send = (res, status, body) => { res.writeHead(status, {'Content-Type':'app
 http.createServer(async (req,res) => {
   // No CORS allowance: use the same-origin Vite proxy during the local demo.
   if (req.headers.origin && !/^http:\/\/(localhost|127\.0\.0\.1):5173$/.test(req.headers.origin)) return send(res,403,{error:'Origin not allowed'})
+  if (req.url === '/api/health' && req.method === 'GET') {
+    try {
+      await pool.query('SELECT 1')
+      return send(res,200,{status:'ready',database:'connected'})
+    } catch { return send(res,503,{status:'unavailable',database:'disconnected'}) }
+  }
   if (req.url !== '/api/events') return send(res,404,{error:'Not found'})
   try {
     if (req.method === 'GET') {
