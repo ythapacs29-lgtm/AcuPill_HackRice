@@ -1,4 +1,6 @@
 import http from 'node:http'
+import { isDeepStrictEqual } from 'node:util'
+import { validEventContext } from './event-context.mjs'
 import pg from 'pg'
 import { databaseConfig } from './db-config.mjs'
 
@@ -19,7 +21,7 @@ function validate(e) {
   if (!['duration_ms','device_uptime_ms','sample_count'].every(k => Number.isSafeInteger(e[k]) && e[k] >= 0) || e.sample_count < 1) return false
   if (!fields.slice(8,14).every(k => Number.isFinite(e[k]) && e[k] >= 0)) return false
   if (e.max_tilt_degrees > 180 || e.average_tilt_degrees > 180) return false
-  return ['baseline','percent_changes','schedule_match'].every(k => e[k] == null || (typeof e[k] === 'object' && !Array.isArray(e[k])))
+  return validEventContext(e)
 }
 const send = (res, status, body) => { res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(body)) }
 http.createServer(async (req,res) => {
@@ -51,7 +53,7 @@ http.createServer(async (req,res) => {
       const existing = await client.query('SELECT * FROM interaction_events WHERE event_id=$1',[e.event_id])
       if (existing.rows.length) {
         const row=existing.rows[0]
-        const equal=fields.every(k => k==='recorded_at' ? row[k].toISOString()===e[k] : ['device_uptime_ms','duration_ms'].includes(k) ? Number(row[k])===e[k] : JSON.stringify(row[k] ?? null)===JSON.stringify(e[k] ?? null))
+        const equal=fields.every(k => k==='recorded_at' ? row[k].toISOString()===e[k] : ['device_uptime_ms','duration_ms'].includes(k) ? Number(row[k])===e[k] : isDeepStrictEqual(row[k] ?? null,e[k] ?? null))
         await client.query('COMMIT')
         return send(res,equal?200:409,equal?{event:row}:{error:'event_id already exists with different content'})
       }
