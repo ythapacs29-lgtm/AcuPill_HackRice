@@ -20,3 +20,7 @@ The UI should use relative `/api/events` URLs; Vite forwards `/api` to port 3001
 `GET /api/health` returns 200 only when the database is reachable, otherwise 503.
 Both servers are for local development. Port 5173 is fixed to match the current origin check.
 No database credentials belong in frontend configuration.
+
+## Temporary demo TLS workaround
+
+Set `ACUPILL_DEV_INSECURE_TLS=true` only in local `server/.env` to retain encryption while skipping server identity verification. This is for synthetic hackathon demo data only. It is rejected when NODE_ENV=production. Remove the setting or set it to false to restore certificate verification; restart the backend afterward. This does not fix or authenticate the certificate chain.

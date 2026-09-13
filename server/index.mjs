@@ -1,13 +1,12 @@
 import http from 'node:http'
 import pg from 'pg'
+import { databaseConfig } from './db-config.mjs'
 
 const { DATABASE_URL, ACUPILL_PATIENT_ID, ACUPILL_DEVICE_ID } = process.env
 if (!DATABASE_URL || !ACUPILL_PATIENT_ID || !ACUPILL_DEVICE_ID) {
   throw new Error('Set DATABASE_URL, ACUPILL_PATIENT_ID and ACUPILL_DEVICE_ID in server/.env')
 }
-const databaseUrl = new URL(DATABASE_URL)
-databaseUrl.searchParams.set('sslmode', 'verify-full')
-const pool = new pg.Pool({ connectionString: databaseUrl.toString(), connectionTimeoutMillis: 10000, query_timeout: 10000 })
+const pool = new pg.Pool(databaseConfig())
 const fields = ['event_id','patient_id','device_id','recorded_at','device_uptime_ms','detector_version','duration_ms','touch_seen','max_tilt_degrees','average_tilt_degrees','total_motion_score','average_motion_score','peak_motion_score','motion_variability_score','sample_count','baseline','percent_changes','schedule_match']
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 function validate(e) {
