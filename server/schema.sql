@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS interaction_events (
   schedule_match jsonb,
   PRIMARY KEY (event_id, recorded_at)
 );
+ALTER TABLE public.interaction_events ADD COLUMN IF NOT EXISTS average_jerk double precision;
+ALTER TABLE public.interaction_events ADD COLUMN IF NOT EXISTS peak_jerk double precision;
+ALTER TABLE public.interaction_events ADD COLUMN IF NOT EXISTS metrics_source text;
 SELECT create_hypertable('interaction_events', by_range('recorded_at'), if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS interaction_patient_time ON interaction_events(patient_id, recorded_at DESC);
 CREATE TABLE IF NOT EXISTS medication_schedules (

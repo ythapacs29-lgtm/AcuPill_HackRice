@@ -1474,6 +1474,13 @@ function MetricCard({
    ============================================================ */
 
 function App() {
+  const [motionAnalysis, setMotionAnalysis] = useState(null)
+  useEffect(() => {
+    const receive = event => setMotionAnalysis(event.detail)
+    window.addEventListener('acupill-motion-analysis', receive)
+    return () => window.removeEventListener('acupill-motion-analysis', receive)
+  }, [])
+
   /* =========================================================
      LOGIN
      ========================================================= */
@@ -2563,6 +2570,12 @@ function App() {
       baseline: null,
       percent_changes: null,
       schedule_match: null,
+    }, {
+      reference: { ...interaction.reference },
+      initial_sample: interaction.initialSample,
+      start_ms: interaction.startTime,
+      end_ms: t_ms,
+      samples: interaction.samples.map(({t_ms, ax, ay, az}) => ({t_ms, ax, ay, az})),
     })
 
     void flushPendingEventUploads()
@@ -2617,6 +2630,9 @@ function App() {
         touchSeen:
           context.touch === 1,
 
+        // Freeze calibration and the trigger sample for exact first-delta parity.
+        reference: { ...restBaselineRef.current },
+        initialSample: { ...previousDataRef.current },
         samples: [],
       }
 
@@ -4822,6 +4838,16 @@ function App() {
             </p>
           </section>
 
+          <section aria-label="Completed session analysis">
+            <p className="card-label">Completed session analysis</p>
+            <p>{motionAnalysis
+              ? `Latest metrics: ${motionAnalysis.metrics_source === 'matlab' ? 'MATLAB' : 'JavaScript fallback'}`
+              : 'Waiting for a new accepted interaction.'}</p>
+            {motionAnalysis && <p className="tiny-text">
+              Average jerk: {motionAnalysis.average_jerk?.toFixed(3) ?? 'Unavailable'} ·
+              Peak jerk: {motionAnalysis.peak_jerk?.toFixed(3) ?? 'Unavailable'} (sensor units/s)
+            </p>}
+          </section>
           <section className="engineering-top-grid">
             <div className="engineering-feature">
               <p className="card-label">

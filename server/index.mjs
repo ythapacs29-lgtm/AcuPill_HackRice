@@ -1,3 +1,5 @@
+import { createMatlabWorker } from './matlab-worker.mjs'
+import { analyzeSessionJS } from '../src/services/motionAnalysis.js'
 import http from 'node:http'
 import { isDeepStrictEqual } from 'node:util'
 import { validEventContext } from './event-context.mjs'
@@ -9,7 +11,11 @@ if (!DATABASE_URL || !ACUPILL_PATIENT_ID || !ACUPILL_DEVICE_ID) {
   throw new Error('Set DATABASE_URL, ACUPILL_PATIENT_ID and ACUPILL_DEVICE_ID in server/.env')
 }
 const pool = new pg.Pool(databaseConfig())
-const fields = ['event_id','patient_id','device_id','recorded_at','device_uptime_ms','detector_version','duration_ms','touch_seen','max_tilt_degrees','average_tilt_degrees','total_motion_score','average_motion_score','peak_motion_score','motion_variability_score','sample_count','baseline','percent_changes','schedule_match']
+const motionWorker = createMatlabWorker()
+for (const signal of ['SIGINT','SIGTERM']) process.once(signal, async () => {
+  await motionWorker.stop(); await pool.end(); process.exit(0)
+})
+const fields = ['event_id','patient_id','device_id','recorded_at','device_uptime_ms','detector_version','duration_ms','touch_seen','max_tilt_degrees','average_tilt_degrees','total_motion_score','average_motion_score','peak_motion_score','motion_variability_score','sample_count','baseline','percent_changes','schedule_match','average_jerk','peak_jerk','metrics_source']
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 function validate(e) {
   if (!e || typeof e !== 'object' || Array.isArray(e)) return false
@@ -21,12 +27,26 @@ function validate(e) {
   if (!['duration_ms','device_uptime_ms','sample_count'].every(k => Number.isSafeInteger(e[k]) && e[k] >= 0) || e.sample_count < 1) return false
   if (!fields.slice(8,14).every(k => Number.isFinite(e[k]) && e[k] >= 0)) return false
   if (e.max_tilt_degrees > 180 || e.average_tilt_degrees > 180) return false
+  if (['average_jerk','peak_jerk'].some(k => e[k]!=null && (!Number.isFinite(e[k]) || e[k]<0))) return false
+  if (e.metrics_source!=null && !['matlab','js_fallback'].includes(e.metrics_source)) return false
   return validEventContext(e)
 }
 const send = (res, status, body) => { res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(body)) }
 http.createServer(async (req,res) => {
   // No CORS allowance: use the same-origin Vite proxy during the local demo.
   if (req.headers.origin && !/^http:\/\/(localhost|127\.0\.0\.1):5173$/.test(req.headers.origin)) return send(res,403,{error:'Origin not allowed'})
+  if (req.url === '/api/motion/status' && req.method === 'GET') return send(res,200,{status:motionWorker.status()})
+  if (req.url === '/api/motion/analyze') {
+    if (req.method !== 'POST') return send(res,405,{error:'Method not allowed'})
+    let body=''
+    try {
+      for await (const chunk of req) {body+=chunk;if(Buffer.byteLength(body)>1048576)return send(res,413,{error:'Session too large'})}
+    } catch {return send(res,400,{error:'Incomplete motion session'})}
+    let session
+    try {session=JSON.parse(body);analyzeSessionJS(session)} catch {return send(res,400,{error:'Invalid motion session'})}
+    try {return send(res,200,await motionWorker.analyze(session))}
+    catch {return send(res,503,{error:'MATLAB unavailable; use JavaScript metrics'})}
+  }
   if (req.url === '/api/health' && req.method === 'GET') {
     try {
       await pool.query('SELECT 1')
